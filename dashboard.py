@@ -126,18 +126,18 @@ def add_to_foneday_cart(foneday_sku: str, quantity: int, note: str = None):
 
 
 def get_product_info_from_catalog(sku: str):
-    """Obține informații produs din schema catalog"""
+    """Obține informații produs din catalog (prin view)"""
     try:
-        # Folosește schema catalog explicit
-        result = supabase.schema("catalog").table("product_sku").select(
+        # Folosește view-ul v_product_sku din public
+        result = supabase.table("v_product_sku").select(
             "product_id, is_primary"
         ).eq("sku", sku).eq("is_primary", True).limit(1).execute()
         
         if result.data and len(result.data) > 0:
             product_id = result.data[0]["product_id"]
             
-            # Citește numele produsului din catalog
-            product_result = supabase.schema("catalog").table("product").select("name").eq("id", product_id).limit(1).execute()
+            # Folosește view-ul v_product din public
+            product_result = supabase.table("v_product").select("name").eq("id", product_id).limit(1).execute()
             
             if product_result.data and len(product_result.data) > 0:
                 return {
@@ -149,14 +149,15 @@ def get_product_info_from_catalog(sku: str):
         
         return None
     except Exception as e:
+        print(f"Error in get_product_info: {e}")
         return None
 
 
 def get_all_skus_for_sku(sku: str):
     """Obține toate SKU-urile (inclusiv secundare) pentru un SKU dat"""
     try:
-        # Folosește schema catalog explicit
-        result = supabase.schema("catalog").table("product_sku").select(
+        # Folosește view-ul v_product_sku din public
+        result = supabase.table("v_product_sku").select(
             "product_id"
         ).eq("sku", sku).eq("is_primary", True).limit(1).execute()
         
@@ -165,8 +166,7 @@ def get_all_skus_for_sku(sku: str):
         
         product_id = result.data[0]["product_id"]
         
-        # Găsește toate SKU-urile pentru acest product
-        all_skus_result = supabase.schema("catalog").table("product_sku").select(
+        all_skus_result = supabase.table("v_product_sku").select(
             "sku, is_primary"
         ).eq("product_id", product_id).execute()
         
@@ -175,6 +175,7 @@ def get_all_skus_for_sku(sku: str):
         
         return [{"sku": sku, "is_primary": True}]
     except Exception as e:
+        print(f"Error in get_all_skus: {e}")
         return [{"sku": sku, "is_primary": True}]
 
 
@@ -472,7 +473,7 @@ def step2_import_foneday_all_products():
         return 0
 
 
-# ============ PASUL 3: Mapare SKU → artcode (CORECTAT) ============
+# ============ PASUL 3: Mapare SKU → artcode ============
 def step3_map_sku_to_artcode():
     """PASUL 3: Mapare SKU-uri mele cu artcode-uri Foneday"""
     
@@ -484,8 +485,8 @@ def step3_map_sku_to_artcode():
     status_container.info("🔗 PASUL 3: Mapare SKU-uri...")
     
     try:
-        # IMPORTANT: Folosește schema catalog explicit
-        my_skus_result = supabase.schema("catalog").table("product_sku").select("sku, product_id, is_primary").execute()
+        # Folosește view-ul v_product_sku din public
+        my_skus_result = supabase.table("v_product_sku").select("sku, product_id, is_primary").execute()
         
         if not my_skus_result.data:
             st.warning("Nu există SKU-uri de mapat")
@@ -501,7 +502,6 @@ def step3_map_sku_to_artcode():
             status_container.info(f"🔗 Mapare {idx+1}/{len(my_skus)}: {my_sku}")
             progress_bar.progress((idx + 1) / len(my_skus))
             
-            # Caută în Foneday (public schema)
             foneday_result = supabase.table("claude_foneday_products").select("*").eq(
                 "artcode", my_sku
             ).execute()
@@ -1254,5 +1254,5 @@ elif page == "📝 Log":
 
 
 st.sidebar.markdown("---")
-st.sidebar.caption("📦 ServicePack v3.2")
-st.sidebar.caption("5 Pași Individuali + Explicații + Oportunități")
+st.sidebar.caption("📦 ServicePack v3.3")
+st.sidebar.caption("Views catalog.* → public.v_*")

@@ -659,7 +659,7 @@ def step4_check_stock_and_prices():
     return total_checked, total_available
 
 
-# ============ PASUL 5: Adaugă în coș ============
+# ============ PASUL 5: Adaugă în coș (MODIFICAT - permite comenzi repetate) ============
 def step5_add_to_cart():
     """PASUL 5: Adaugă în coș Foneday produsele profitabile (2 bucăți)"""
     
@@ -701,17 +701,13 @@ def step5_add_to_cart():
         if is_profitable(foneday_price, woo_price):
             profit_margin = calculate_profit_margin(foneday_price, woo_price)
             
-            existing_cart = supabase.table("claude_foneday_cart").select("id").eq(
-                "sku", my_sku
-            ).eq("foneday_sku", foneday_sku).eq("status", "added_to_cart").execute()
-            
-            if existing_cart.data:
-                continue
-            
+            # NU MAI VERIFICĂM dacă e deja în coș - permite comenzi repetate
+            # Adaugă direct în coș Foneday (2 bucăți)
             cart_result = add_to_foneday_cart(foneday_sku, 2, f"Auto-import - {my_sku}")
             
             if cart_result:
                 try:
+                    # Salvează în istoric (fără verificare de duplicat)
                     supabase.table("claude_foneday_cart").insert({
                         "product_id": item.get("product_id"),
                         "sku": my_sku,
@@ -739,6 +735,7 @@ def step5_add_to_cart():
     log_event("step5_complete", f"PASUL 5 complet: {added_to_cart} adăugate, {not_profitable} neprofitabile", status="success")
     
     return added_to_cart, not_profitable
+
 
 
 # ============ FUNCȚIE NOUĂ: Căutare Oportunități Profit Mare ============
@@ -1150,6 +1147,9 @@ elif page == "💰 Oportunități Profit":
         if opportunities:
             st.success(f"🎉 Găsite {len(opportunities)} oportunități de profit ≥{min_profit}%!")
             
+            # Salvează oportunități în session state pentru a le putea procesa
+            st.session_state['opportunities'] = opportunities
+            
             df = pd.DataFrame(opportunities)
             df = df.sort_values("profit_margin", ascending=False)
             
@@ -1159,7 +1159,7 @@ elif page == "💰 Oportunități Profit":
                     "profit_margin", "current_stock", "quality"
                 ]],
                 use_container_width=True,
-                height=500
+                height=400
             )
             
             st.markdown("---")
@@ -1179,88 +1179,150 @@ elif page == "💰 Oportunități Profit":
             with col4:
                 with_stock = len(df[df["current_stock"] > 0])
                 st.metric("📦 Cu Stoc Existent", with_stock)
-            
-            st.markdown("---")
-            if st.button("📥 Exportă Oportunități (CSV)"):
-                csv = df.to_csv(index=False)
-                st.download_button(
-                    label="⬇️ Descarcă CSV",
-                    data=csv,
-                    file_name=f"oportunitati_profit_{min_profit}pct_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
-                    mime="text/csv"
-                )
         else:
             st.warning(f"Nu s-au găsit oportunități cu profit ≥{min_profit}%")
             st.info("💡 Sugestii:\n- Încearcă o marjă mai mică\n- Asigură-te că ai rulat PASUL 2 (Import Foneday) și PASUL 3 (Mapare)")
-
-
-elif page == "📊 Stocuri Critice":
-    st.title("⚠️ Produse cu Stoc Zero")
     
-    try:
-        critical = supabase.table("claude_v_critical_stock").select("*").execute()
+    # Afișează formularul de comandă dacă există oportunități
+    if 'opportunities' in st.session_state and st.session_state['opportunities']:
+        st.markdown("---")
+        st.markdown("## 🛒 Comandă Produse Selectate")
         
-        if critical.data and len(critical.data) > 0:
-            df = pd.DataFrame(critical.data)
-            
-            st.metric("📊 Total Produse Stoc Zero", len(df))
-            
-            st.dataframe(
-                df[[
-                    "sku", "name", "stock_quantity", "woo_price_ron",
-                    "foneday_sku", "foneday_price_eur", "foneday_instock",
-                    "profit_margin_percent"
-                ]],
-                use_container_width=True,
-                height=500
-            )
-        else:
-            st.success("✅ Nu există produse cu stoc zero!")
-    except Exception as e:
-        st.error(f"Eroare: {e}")
-
-
-elif page == "🛒 Coș Foneday":
-    st.title("🛒 Produse în Coșul Foneday")
-    
-    try:
-        cart = supabase.table("claude_foneday_cart").select("*").order("created_at", desc=True).limit(200).execute()
+        st.info("💡 Completează cantitatea dorită pentru fiecare produs. Produsele cu cantitate 0 sau goală nu vor fi comandate.")
         
-        if cart.data and len(cart.data) > 0:
-            df = pd.DataFrame(cart.data)
-            
-            st.dataframe(
-                df[[
-                    "created_at", "sku", "foneday_sku",
-                    "quantity", "price_eur", "woo_price_ron",
-                    "profit_margin", "is_profitable", "status", "note"
-                ]],
-                use_container_width=True,
-                height=500
-            )
-            
-            st.markdown("---")
-            col1, col2, col3 = st.columns(3)
+        opportunities = st.session_state['opportunities']
+        
+        # Creează un formular pentru cantități
+        quantities = {}
+        
+        # Header
+        col1, col2, col3, col4, col5, col6 = st.columns([2, 2, 1, 1, 1, 1])
+        with col1:
+            st.markdown("**SKU**")
+        with col2:
+            st.markdown("**Produs**")
+        with col3:
+            st.markdown("**Profit %**")
+        with col4:
+            st.markdown("**Stoc Actual**")
+        with col5:
+            st.markdown("**Preț EUR**")
+        with col6:
+            st.markdown("**Cantitate**")
+        
+        st.markdown("---")
+        
+        # Rânduri pentru fiecare oportunitate
+        for idx, opp in enumerate(opportunities):
+            col1, col2, col3, col4, col5, col6 = st.columns([2, 2, 1, 1, 1, 1])
             
             with col1:
-                total_value = (df["price_eur"] * df["quantity"]).sum()
-                st.metric("💰 Valoare Totală (EUR)", f"€{total_value:.2f}")
-            
+                st.text(opp["sku"])
             with col2:
-                profitable_df = df[df["is_profitable"] == True]
-                if len(profitable_df) > 0:
-                    avg_margin = profitable_df["profit_margin"].mean()
-                    st.metric("📈 Marjă Medie", f"{avg_margin:.2f}%")
-                else:
-                    st.metric("📈 Marjă Medie", "N/A")
-            
+                st.text(opp["product_name"][:30] + "..." if len(opp["product_name"]) > 30 else opp["product_name"])
             with col3:
-                total_items = df["quantity"].sum()
-                st.metric("📦 Total Bucăți", int(total_items))
-        else:
-            st.info("Nu există produse în coș")
-    except Exception as e:
-        st.error(f"Eroare: {e}")
+                st.text(f"{opp['profit_margin']:.1f}%")
+            with col4:
+                st.text(str(opp["current_stock"]))
+            with col5:
+                st.text(f"€{opp['foneday_price_eur']:.2f}")
+            with col6:
+                qty = st.number_input(
+                    "Qty",
+                    min_value=0,
+                    max_value=100,
+                    value=0,
+                    step=1,
+                    key=f"qty_{idx}",
+                    label_visibility="collapsed"
+                )
+                quantities[idx] = qty
+        
+        st.markdown("---")
+        
+        # Buton de comandă
+        col1, col2, col3 = st.columns([1, 1, 1])
+        
+        with col2:
+            if st.button("🛒 PLASEAZĂ COMANDA", type="primary", use_container_width=True):
+                
+                # Filtrează produsele cu cantitate > 0
+                to_order = []
+                for idx, qty in quantities.items():
+                    if qty > 0:
+                        to_order.append({
+                            "opportunity": opportunities[idx],
+                            "quantity": qty
+                        })
+                
+                if not to_order:
+                    st.warning("⚠️ Nu ai selectat nicio cantitate! Completează cantitățile mai întâi.")
+                else:
+                    st.info(f"📦 Plasez comandă pentru {len(to_order)} produse...")
+                    
+                    success_count = 0
+                    error_count = 0
+                    
+                    progress_bar_order = st.progress(0)
+                    status_order = st.empty()
+                    
+                    for idx, item in enumerate(to_order):
+                        opp = item["opportunity"]
+                        qty = item["quantity"]
+                        
+                        status_order.info(f"🛒 Comand {idx+1}/{len(to_order)}: {opp['sku']} × {qty}")
+                        progress_bar_order.progress((idx + 1) / len(to_order))
+                        
+                        # Adaugă în coșul Foneday
+                        cart_result = add_to_foneday_cart(opp["foneday_sku"], qty, f"Oportunitate profit {opp['profit_margin']:.1f}% - {opp['sku']}")
+                        
+                        if cart_result:
+                            try:
+                                # Salvează în istoric
+                                supabase.table("claude_foneday_cart").insert({
+                                    "product_id": None,
+                                    "sku": opp["sku"],
+                                    "foneday_sku": opp["foneday_sku"],
+                                    "quantity": qty,
+                                    "price_eur": opp["foneday_price_eur"],
+                                    "woo_price_ron": opp["woo_price_ron"],
+                                    "profit_margin": opp["profit_margin"],
+                                    "is_profitable": True,
+                                    "status": "added_to_cart",
+                                    "note": f"Oportunitate - Profit: {opp['profit_margin']:.1f}% - {qty} buc"
+                                }).execute()
+                                
+                                success_count += 1
+                                log_event("opportunity_order", f"Comandat: {opp['sku']} × {qty} - Profit: {opp['profit_margin']:.1f}%", sku=opp['sku'], status="success")
+                            except Exception as e:
+                                error_count += 1
+                        else:
+                            error_count += 1
+                        
+                        time.sleep(0.2)
+                    
+                    progress_bar_order.progress(1.0)
+                    status_order.empty()
+                    
+                    st.success(f"✅ Comanda finalizată! {success_count} produse adăugate în coș, {error_count} erori.")
+                    
+                    if success_count > 0:
+                        total_value = sum([item["opportunity"]["foneday_price_eur"] * item["quantity"] for item in to_order])
+                        st.info(f"💰 Valoare totală comandă: €{total_value:.2f}")
+        
+        st.markdown("---")
+        
+        # Opțiune export CSV
+        if st.button("📥 Exportă Lista (CSV)"):
+            df = pd.DataFrame(opportunities)
+            csv = df.to_csv(index=False)
+            st.download_button(
+                label="⬇️ Descarcă CSV",
+                data=csv,
+                file_name=f"oportunitati_profit_{min_profit}pct_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                mime="text/csv"
+            )
+
 
 
 elif page == "🗺️ Mapări":

@@ -76,15 +76,15 @@ def is_profitable(foneday_price_eur: float, woo_price_ron: float) -> bool:
     return ratio < MIN_PROFIT_MARGIN
 
 
-def check_foneday_product(sku: str):
-    """Verifică produs în Foneday"""
+def check_foneday_product(artcode: str):
+    """Verifică produs în Foneday folosind artcode"""
     try:
         headers = {
             "Authorization": f"Bearer {FONEDAY_API_TOKEN}",
             "Content-Type": "application/json"
         }
         response = requests.get(
-            f"{FONEDAY_API_URL}/product/{sku}",
+            f"{FONEDAY_API_URL}/product/{artcode}",
             headers=headers,
             timeout=10
         )
@@ -97,8 +97,8 @@ def check_foneday_product(sku: str):
         return None
 
 
-def add_to_foneday_cart(sku: str, quantity: int, note: str = None):
-    """Adaugă produs în coșul Foneday"""
+def add_to_foneday_cart(artcode: str, quantity: int, note: str = None):
+    """Adaugă produs în coșul Foneday folosind artcode"""
     try:
         headers = {
             "Authorization": f"Bearer {FONEDAY_API_TOKEN}",
@@ -106,7 +106,7 @@ def add_to_foneday_cart(sku: str, quantity: int, note: str = None):
         }
         payload = {
             "articles": [{
-                "sku": sku,
+                "sku": artcode,  # Foneday folosește "sku" în payload dar e de fapt artcode
                 "quantity": quantity,
                 "note": note
             }]
@@ -128,7 +128,6 @@ def add_to_foneday_cart(sku: str, quantity: int, note: str = None):
 def get_product_info_from_catalog(sku: str):
     """Obține informații produs din schema catalog"""
     try:
-        # Încearcă să găsești produsul în product_sku din catalog
         result = supabase.table("product_sku").select(
             "product_id, is_primary"
         ).eq("sku", sku).eq("is_primary", True).limit(1).execute()
@@ -136,7 +135,6 @@ def get_product_info_from_catalog(sku: str):
         if result.data and len(result.data) > 0:
             product_id = result.data[0]["product_id"]
             
-            # Încearcă să găsești numele produsului
             product_result = supabase.table("product").select("name").eq("id", product_id).limit(1).execute()
             
             if product_result.data and len(product_result.data) > 0:
@@ -155,7 +153,6 @@ def get_product_info_from_catalog(sku: str):
 def get_all_skus_for_sku(sku: str):
     """Obține toate SKU-urile (inclusiv secundare) pentru un SKU dat"""
     try:
-        # Găsește product_id pentru SKU-ul dat
         result = supabase.table("product_sku").select(
             "product_id"
         ).eq("sku", sku).eq("is_primary", True).limit(1).execute()
@@ -165,7 +162,6 @@ def get_all_skus_for_sku(sku: str):
         
         product_id = result.data[0]["product_id"]
         
-        # Găsește toate SKU-urile pentru acest product_id
         all_skus_result = supabase.table("product_sku").select(
             "sku, is_primary"
         ).eq("product_id", product_id).execute()
@@ -178,17 +174,38 @@ def get_all_skus_for_sku(sku: str):
         return [{"sku": sku, "is_primary": True}]
 
 
-def sync_woocommerce_products():
-    """Sincronizează produse din WooCommerce"""
+def sync_woocommerce_products_incremental():
+    """Sincronizează doar diferențele din WooCommerce (incremental)"""
     page = 1
     per_page = 100
-    total_synced = 0
+    total_new = 0
+    total_updated = 0
+    total_unchanged = 0
     total_errors = 0
     
     progress_bar = st.progress(0)
     status_container = st.empty()
     
-    log_event("sync_start", "Începe sincronizarea WooCommerce", status="info")
+    log_event("sync_start", "Începe sincronizarea incrementală WooCommerce", status="info")
+    
+    # Obține toate SKU-urile existente cu timestamp-ul ultimei sincronizări
+    existing_products = {}
+    try:
+        existing_result = supabase.table("claude_woo_stock").select("sku, stock_quantity, last_sync_at").execute()
+        if existing_result.data:
+            for item in existing_result.data:
+                existing_products[item["sku"]] = {
+                    "stock": item.get("stock_quantity", 0),
+                    "last_sync": item.get("last_sync_at")
+                }
+        
+        existing_prices = {}
+        existing_price_result = supabase.table("claude_woo_prices").select("sku, regular_price").execute()
+        if existing_price_result.data:
+            for item in existing_price_result.data:
+                existing_prices[item["sku"]] = float(item.get("regular_price", 0))
+    except Exception as e:
+        log_event("sync_error", f"Eroare la citirea datelor existente: {e}", status="error")
     
     while True:
         try:
@@ -212,7 +229,6 @@ def sync_woocommerce_products():
                     if not sku:
                         continue
                     
-                    # Încearcă să găsești product_id din catalog
                     product_info = get_product_info_from_catalog(sku)
                     product_id = product_info["product_id"] if product_info else None
                     
@@ -220,33 +236,60 @@ def sync_woocommerce_products():
                     regular_price = product.get("regular_price", "0")
                     woo_product_id = product.get("id")
                     
-                    # Sincronizează stocul
-                    stock_data = {
-                        "sku": sku,
-                        "stock_quantity": stock_quantity if stock_quantity is not None else 0,
-                        "woo_product_id": woo_product_id,
-                        "last_sync_at": datetime.now().isoformat()
-                    }
+                    current_stock = stock_quantity if stock_quantity is not None else 0
+                    current_price = float(regular_price) if regular_price else 0
                     
-                    if product_id:
-                        stock_data["product_id"] = product_id
+                    # Verifică dacă e produs nou sau s-a schimbat ceva
+                    is_new = sku not in existing_products
+                    stock_changed = not is_new and existing_products[sku]["stock"] != current_stock
+                    price_changed = sku in existing_prices and existing_prices[sku] != current_price
                     
-                    supabase.table("claude_woo_stock").upsert(stock_data, on_conflict="sku").execute()
-                    
-                    # Sincronizează prețul
-                    price_data = {
-                        "sku": sku,
-                        "regular_price": float(regular_price) if regular_price else 0,
-                        "woo_product_id": woo_product_id,
-                        "last_sync_at": datetime.now().isoformat()
-                    }
-                    
-                    if product_id:
-                        price_data["product_id"] = product_id
-                    
-                    supabase.table("claude_woo_prices").upsert(price_data, on_conflict="sku").execute()
-                    
-                    total_synced += 1
+                    if is_new:
+                        # Produs nou - INSERT
+                        stock_data = {
+                            "sku": sku,
+                            "stock_quantity": current_stock,
+                            "woo_product_id": woo_product_id,
+                            "last_sync_at": datetime.now().isoformat()
+                        }
+                        
+                        if product_id:
+                            stock_data["product_id"] = product_id
+                        
+                        supabase.table("claude_woo_stock").insert(stock_data).execute()
+                        
+                        price_data = {
+                            "sku": sku,
+                            "regular_price": current_price,
+                            "woo_product_id": woo_product_id,
+                            "last_sync_at": datetime.now().isoformat()
+                        }
+                        
+                        if product_id:
+                            price_data["product_id"] = product_id
+                        
+                        supabase.table("claude_woo_prices").insert(price_data).execute()
+                        
+                        total_new += 1
+                        
+                    elif stock_changed or price_changed:
+                        # Produs modificat - UPDATE doar ce s-a schimbat
+                        if stock_changed:
+                            supabase.table("claude_woo_stock").update({
+                                "stock_quantity": current_stock,
+                                "last_sync_at": datetime.now().isoformat()
+                            }).eq("sku", sku).execute()
+                        
+                        if price_changed:
+                            supabase.table("claude_woo_prices").update({
+                                "regular_price": current_price,
+                                "last_sync_at": datetime.now().isoformat()
+                            }).eq("sku", sku).execute()
+                        
+                        total_updated += 1
+                    else:
+                        # Produs neschimbat
+                        total_unchanged += 1
                     
                 except Exception as e:
                     total_errors += 1
@@ -254,7 +297,7 @@ def sync_woocommerce_products():
             
             progress_bar.progress(min(page / 20, 0.99))
             page += 1
-            time.sleep(0.5)  # Rate limiting
+            time.sleep(0.5)
             
         except Exception as e:
             st.error(f"❌ Eroare: {e}")
@@ -264,13 +307,13 @@ def sync_woocommerce_products():
     progress_bar.progress(1.0)
     status_container.empty()
     
-    log_event("sync_complete", f"Sincronizare completă: {total_synced} produse, {total_errors} erori", status="success")
+    log_event("sync_complete", f"Sincronizare completă: {total_new} noi, {total_updated} actualizate, {total_unchanged} neschimbate, {total_errors} erori", status="success")
     
-    return total_synced, total_errors
+    return total_new, total_updated, total_unchanged, total_errors
 
 
 def check_zero_stock_and_add_to_cart():
-    """Verifică produse cu stoc zero și adaugă în coșul Foneday"""
+    """Verifică produse cu stoc zero și adaugă 2 bucăți în coșul Foneday"""
     
     status_container = st.empty()
     progress_bar = st.progress(0)
@@ -297,7 +340,6 @@ def check_zero_stock_and_add_to_cart():
             sku = product_data.get("sku")
             product_id = product_data.get("product_id")
             
-            # Încearcă să găsești informații despre produs
             product_info = get_product_info_from_catalog(sku) if not product_id else None
             
             if product_info:
@@ -322,22 +364,23 @@ def check_zero_stock_and_add_to_cart():
             if woo_price <= 0:
                 continue
             
-            # Obține toate SKU-urile pentru produs (inclusiv secundare)
+            # Obține toate SKU-urile pentru produs (SKU-urile tale = artcode-urile Foneday)
             all_skus = get_all_skus_for_sku(sku)
             
-            # Caută la Foneday pe toate SKU-urile
+            # Caută la Foneday folosind SKU-urile ca artcode
             foneday_options = []
             
             for sku_item in all_skus:
-                sku_to_check = sku_item["sku"]
-                foneday_product = check_foneday_product(sku_to_check)
+                artcode = sku_item["sku"]  # SKU-ul tău = artcode la Foneday
+                foneday_product = check_foneday_product(artcode)
                 
                 if foneday_product and foneday_product.get("instock") == "Y":
                     foneday_price = float(foneday_product.get("price", 0))
                     
                     if foneday_price > 0:
                         foneday_options.append({
-                            "sku": sku_to_check,
+                            "artcode": artcode,
+                            "sku": sku_item["sku"],
                             "price": foneday_price,
                             "is_primary": sku_item["is_primary"],
                             "product_data": foneday_product
@@ -346,7 +389,7 @@ def check_zero_stock_and_add_to_cart():
                         # Salvează în inventar
                         inventory_data = {
                             "sku": sku,
-                            "foneday_sku": sku_to_check,
+                            "foneday_sku": artcode,
                             "price_eur": foneday_price,
                             "instock": True,
                             "title": foneday_product.get("title"),
@@ -362,7 +405,7 @@ def check_zero_stock_and_add_to_cart():
                             on_conflict="sku,foneday_sku"
                         ).execute()
                 
-                time.sleep(0.2)  # Rate limiting Foneday API
+                time.sleep(0.2)
             
             if not foneday_options:
                 not_in_stock += 1
@@ -373,7 +416,7 @@ def check_zero_stock_and_add_to_cart():
             foneday_options.sort(key=lambda x: (x["price"], not x["is_primary"]))
             best_option = foneday_options[0]
             
-            foneday_sku = best_option["sku"]
+            artcode = best_option["artcode"]
             foneday_price = best_option["price"]
             
             # Verifică profitabilitate
@@ -383,15 +426,15 @@ def check_zero_stock_and_add_to_cart():
                 # Verifică dacă nu e deja în coș
                 existing_cart = supabase.table("claude_foneday_cart").select("id").eq(
                     "sku", sku
-                ).eq("foneday_sku", foneday_sku).eq("status", "added_to_cart").execute()
+                ).eq("foneday_sku", artcode).eq("status", "added_to_cart").execute()
                 
                 if existing_cart.data and len(existing_cart.data) > 0:
-                    continue  # Deja în coș
+                    continue
                 
-                # Adaugă în coșul Foneday
+                # Adaugă 2 bucăți în coșul Foneday
                 cart_result = add_to_foneday_cart(
-                    foneday_sku,
-                    1,  # Cantitate implicită 1
+                    artcode,
+                    2,  # CANTITATE 2 BUCĂȚI
                     f"Auto-import stoc zero - {product_name}"
                 )
                 
@@ -399,14 +442,14 @@ def check_zero_stock_and_add_to_cart():
                     # Salvează în tabel
                     cart_data = {
                         "sku": sku,
-                        "foneday_sku": foneday_sku,
-                        "quantity": 1,
+                        "foneday_sku": artcode,
+                        "quantity": 2,  # CANTITATE 2 BUCĂȚI
                         "price_eur": foneday_price,
                         "woo_price_ron": woo_price,
                         "profit_margin": profit_margin,
                         "is_profitable": True,
                         "status": "added_to_cart",
-                        "note": f"Import automat - Profit: {profit_margin}%"
+                        "note": f"Import automat - Profit: {profit_margin}% - 2 buc"
                     }
                     
                     if product_id:
@@ -415,7 +458,7 @@ def check_zero_stock_and_add_to_cart():
                     supabase.table("claude_foneday_cart").insert(cart_data).execute()
                     
                     added_to_cart += 1
-                    log_event("cart_add", f"Adăugat în coș: {product_name} - Profit: {profit_margin}%", 
+                    log_event("cart_add", f"Adăugat 2 buc în coș: {product_name} - Profit: {profit_margin}%", 
                              sku=sku, product_id=product_id, status="success")
                 else:
                     log_event("cart_error", f"Eroare adăugare coș: {product_name}", sku=sku, status="error")
@@ -426,8 +469,8 @@ def check_zero_stock_and_add_to_cart():
                 # Salvează ca neprofitabil
                 cart_data = {
                     "sku": sku,
-                    "foneday_sku": foneday_sku,
-                    "quantity": 1,
+                    "foneday_sku": artcode,
+                    "quantity": 2,
                     "price_eur": foneday_price,
                     "woo_price_ron": woo_price,
                     "profit_margin": profit_margin,
@@ -451,7 +494,7 @@ def check_zero_stock_and_add_to_cart():
     progress_bar.progress(1.0)
     status_container.empty()
     
-    log_event("foneday_complete", f"Verificare completă: {added_to_cart} adăugate, {not_profitable} neprofitabile, {not_in_stock} fără stoc", status="success")
+    log_event("foneday_complete", f"Verificare completă: {added_to_cart} adăugate (2 buc fiecare), {not_profitable} neprofitabile, {not_in_stock} fără stoc", status="success")
     
     return added_to_cart, not_profitable, not_in_stock
 
@@ -552,23 +595,23 @@ if page == "🏠 Dashboard":
 
 
 elif page == "🔄 Import Zilnic":
-    st.title("🔄 Import Zilnic Automat")
+    st.title("🔄 Import Zilnic Incremental")
     
     st.markdown("""
     ### Ce face această funcție?
     
-    **Pasul 1: Sincronizare WooCommerce**
-    - 📥 Citește toate produsele din WooCommerce
-    - 💾 Salvează stocurile în baza de date
-    - 💰 Salvează prețurile în baza de date
+    **Pasul 1: Sincronizare Incrementală WooCommerce**
+    - 📥 Adaugă produsele noi
+    - 🔄 Actualizează doar stocurile și prețurile modificate
+    - ⚡ Mult mai rapid decât importul complet
     
-    **Pasul 2: Verificare Foneday**
+    **Pasul 2: Verificare Foneday (artcode)**
     - 🔍 Găsește produse cu stoc zero
-    - 🌐 Verifică disponibilitate la Foneday
+    - 🌐 Caută după artcode (SKU-ul tău) în Foneday
     - 📊 Calculează profitabilitatea
-    - 🛒 Adaugă automat în coș doar produsele profitabile
+    - 🛒 Adaugă automat **2 bucăți** în coș pentru produse profitabile
     
-    ⚠️ **Important**: Procesul poate dura 5-15 minute pentru catalog mare!
+    ⚠️ **Important**: Procesul poate dura 3-10 minute!
     """)
     
     st.markdown("---")
@@ -576,34 +619,35 @@ elif page == "🔄 Import Zilnic":
     col1, col2 = st.columns(2)
     
     with col1:
-        run_sync = st.checkbox("✅ Pasul 1: Sincronizează WooCommerce", value=True)
+        run_sync = st.checkbox("✅ Pasul 1: Sincronizare Incrementală WooCommerce", value=True)
     
     with col2:
-        run_foneday = st.checkbox("✅ Pasul 2: Verifică Foneday & Adaugă în Coș", value=True)
+        run_foneday = st.checkbox("✅ Pasul 2: Verifică Foneday & Adaugă 2 buc în Coș", value=True)
     
     st.markdown("---")
     
-    if st.button("▶️ ÎNCEPE IMPORT COMPLET", type="primary", use_container_width=True):
+    if st.button("▶️ ÎNCEPE IMPORT INCREMENTAL", type="primary", use_container_width=True):
         
         start_time = datetime.now()
         
-        # PASUL 1: Sincronizare WooCommerce
+        # PASUL 1: Sincronizare incrementală WooCommerce
         if run_sync:
-            st.markdown("## 📥 Pasul 1: Sincronizare WooCommerce")
-            total_synced, total_errors = sync_woocommerce_products()
-            st.success(f"✅ Sincronizare completă: **{total_synced}** produse, **{total_errors}** erori")
+            st.markdown("## 📥 Pasul 1: Sincronizare Incrementală WooCommerce")
+            total_new, total_updated, total_unchanged, total_errors = sync_woocommerce_products_incremental()
+            st.success(f"✅ Sincronizare completă: **{total_new}** noi, **{total_updated}** actualizate, **{total_unchanged}** neschimbate, **{total_errors}** erori")
             st.markdown("---")
         
         # PASUL 2: Verificare Foneday
         if run_foneday:
-            st.markdown("## 🌐 Pasul 2: Verificare Foneday & Adăugare Coș")
+            st.markdown("## 🌐 Pasul 2: Verificare Foneday & Adăugare Coș (2 buc)")
             added, not_profitable, not_in_stock = check_zero_stock_and_add_to_cart()
             
             st.success("✅ Verificare Foneday completă!")
             
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("🛒 Adăugate în Coș", added)
+                st.metric("🛒 Adăugate în Coș", f"{added} produse")
+                st.caption(f"({added * 2} bucăți total)")
             with col2:
                 st.metric("⚠️ Neprofitabile", not_profitable)
             with col3:
@@ -630,7 +674,6 @@ elif page == "📊 Stocuri Critice":
             
             st.markdown("---")
             
-            # Filtre
             col1, col2 = st.columns(2)
             
             with col1:
@@ -671,7 +714,6 @@ elif page == "🛒 Coș Foneday":
         if cart.data and len(cart.data) > 0:
             df = pd.DataFrame(cart.data)
             
-            # Filtre status
             status_options = df["status"].unique().tolist()
             selected_status = st.multiselect(
                 "Filtrează după status",
@@ -691,7 +733,6 @@ elif page == "🛒 Coș Foneday":
                 height=500
             )
             
-            # Statistici
             st.markdown("---")
             col1, col2, col3 = st.columns(3)
             
@@ -709,7 +750,7 @@ elif page == "🛒 Coș Foneday":
             
             with col3:
                 total_items = filtered["quantity"].sum()
-                st.metric("📦 Total Articole", int(total_items))
+                st.metric("📦 Total Bucăți", int(total_items))
         else:
             st.info("Nu există produse în coș")
     except Exception as e:
@@ -732,7 +773,6 @@ elif page == "📝 Istoric Log":
     with col3:
         limit = st.number_input("Număr rezultate", min_value=10, max_value=500, value=100, step=10)
     
-    # Query
     try:
         query = supabase.table("claude_sync_logs").select("*")
         
@@ -754,7 +794,6 @@ elif page == "📝 Istoric Log":
                 height=500
             )
             
-            # Export
             if st.button("📥 Exportă CSV"):
                 csv = df.to_csv(index=False)
                 st.download_button(
@@ -771,5 +810,5 @@ elif page == "📝 Istoric Log":
 
 # Footer
 st.sidebar.markdown("---")
-st.sidebar.caption("📦 ServicePack Stock Sync v2.0")
-st.sidebar.caption("Powered by Streamlit & Supabase")
+st.sidebar.caption("📦 ServicePack Stock Sync v2.1")
+st.sidebar.caption("Sincronizare Incrementală + Foneday artcode")

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta
 from woocommerce import API
 import requests
 import time
+import json
 
 # Configurare pagină
 st.set_page_config(
@@ -381,9 +382,9 @@ def step1_import_woocommerce():
     return total_new, total_updated, total_unchanged, total_errors
 
 
-# ============ PASUL 2: Import toate produsele Foneday ============
+# ============ PASUL 2: Import + Normalizare artcode ============
 def step2_import_foneday_all_products():
-    """PASUL 2: Import toate produsele din Foneday"""
+    """PASUL 2: Import toate produsele din Foneday + normalizare artcode"""
     
     progress_bar = st.progress(0)
     status_container = st.empty()
@@ -421,16 +422,22 @@ def step2_import_foneday_all_products():
         
         batch_size = 100
         total_saved = 0
+        total_artcodes_normalized = 0
         
         for i in range(0, len(products), batch_size):
             batch = products[i:i+batch_size]
             batch_data = []
+            batch_artcodes = []
             
             for product in batch:
                 try:
+                    foneday_sku = product.get("sku")
+                    artcode_raw = product.get("artcode")
+                    
+                    # Salvează produsul complet
                     batch_data.append({
-                        "foneday_sku": product.get("sku"),
-                        "artcode": product.get("artcode"),
+                        "foneday_sku": foneday_sku,
+                        "artcode": artcode_raw,  # Păstrăm originalul ca JSON
                         "ean": product.get("ean"),
                         "title": product.get("title"),
                         "instock": product.get("instock"),
@@ -443,9 +450,37 @@ def step2_import_foneday_all_products():
                         "price_eur": float(product.get("price", 0)) if product.get("price") else None,
                         "last_sync_at": datetime.now().isoformat()
                     })
+                    
+                    # NORMALIZARE artcode: extrage toate valorile din array
+                    if artcode_raw:
+                        artcodes_list = []
+                        
+                        # Dacă e string JSON, parsează-l
+                        if isinstance(artcode_raw, str):
+                            try:
+                                # Încearcă să parseze JSON
+                                artcodes_list = json.loads(artcode_raw)
+                            except:
+                                # Dacă nu e JSON valid, tratează-l ca string simplu
+                                artcodes_list = [artcode_raw.strip()]
+                        elif isinstance(artcode_raw, list):
+                            artcodes_list = artcode_raw
+                        else:
+                            artcodes_list = [str(artcode_raw)]
+                        
+                        # Creează înregistrări normalizate pentru fiecare artcode
+                        for artcode_value in artcodes_list:
+                            artcode_clean = str(artcode_value).strip().strip('"').strip("'")
+                            if artcode_clean:
+                                batch_artcodes.append({
+                                    "foneday_sku": foneday_sku,
+                                    "artcode": artcode_clean
+                                })
+                
                 except Exception as e:
                     continue
             
+            # Salvează produsele
             if batch_data:
                 try:
                     supabase.table("claude_foneday_products").upsert(
@@ -453,17 +488,27 @@ def step2_import_foneday_all_products():
                         on_conflict="foneday_sku"
                     ).execute()
                     total_saved += len(batch_data)
-                    
-                    status_container.info(f"💾 Salvate {total_saved}/{len(products)} produse Foneday...")
-                    progress_bar.progress(total_saved / len(products))
                 except Exception as e:
-                    st.error(f"Eroare salvare batch: {e}")
-                    continue
+                    st.error(f"Eroare salvare produse: {e}")
+            
+            # Salvează artcode-urile normalizate
+            if batch_artcodes:
+                try:
+                    supabase.table("claude_foneday_artcodes_normalized").upsert(
+                        batch_artcodes,
+                        on_conflict="foneday_sku,artcode"
+                    ).execute()
+                    total_artcodes_normalized += len(batch_artcodes)
+                except Exception as e:
+                    st.error(f"Eroare salvare artcodes: {e}")
+            
+            status_container.info(f"💾 Salvate {total_saved}/{len(products)} produse, {total_artcodes_normalized} artcodes...")
+            progress_bar.progress(total_saved / len(products))
         
         progress_bar.progress(1.0)
         status_container.empty()
         
-        log_event("step2_complete", f"PASUL 2 complet: {total_saved} produse Foneday importate", status="success")
+        log_event("step2_complete", f"PASUL 2 complet: {total_saved} produse, {total_artcodes_normalized} artcodes normalizate", status="success")
         
         return total_saved
         
@@ -473,9 +518,9 @@ def step2_import_foneday_all_products():
         return 0
 
 
-# ============ PASUL 3: Mapare SKU → artcode ============
+# ============ PASUL 3: Mapare SKU → artcode (FOLOSIND TABELUL NORMALIZAT) ============
 def step3_map_sku_to_artcode():
-    """PASUL 3: Mapare SKU-uri mele cu artcode-uri Foneday"""
+    """PASUL 3: Mapare SKU-uri mele cu artcode-uri Foneday (normalizate)"""
     
     progress_bar = st.progress(0)
     status_container = st.empty()
@@ -502,26 +547,30 @@ def step3_map_sku_to_artcode():
             status_container.info(f"🔗 Mapare {idx+1}/{len(my_skus)}: {my_sku}")
             progress_bar.progress((idx + 1) / len(my_skus))
             
-            foneday_result = supabase.table("claude_foneday_products").select("*").eq(
-                "artcode", my_sku
-            ).execute()
+            # Caută în tabelul NORMALIZAT de artcodes
+            artcode_result = supabase.table("claude_foneday_artcodes_normalized").select(
+                "foneday_sku, artcode"
+            ).eq("artcode", my_sku).execute()
             
-            if foneday_result.data and len(foneday_result.data) > 0:
-                foneday_product = foneday_result.data[0]
-                
-                try:
-                    supabase.table("claude_sku_artcode_mapping").upsert({
-                        "my_sku": my_sku,
-                        "foneday_artcode": foneday_product["artcode"],
-                        "foneday_sku": foneday_product["foneday_sku"],
-                        "product_id": product_id,
-                        "mapping_score": 100,
-                        "last_verified_at": datetime.now().isoformat()
-                    }, on_conflict="my_sku,foneday_artcode").execute()
+            if artcode_result.data and len(artcode_result.data) > 0:
+                # Poate exista mai multe produse Foneday cu același artcode
+                for match in artcode_result.data:
+                    foneday_sku = match["foneday_sku"]
+                    artcode_match = match["artcode"]
                     
-                    total_mapped += 1
-                except Exception as e:
-                    continue
+                    try:
+                        supabase.table("claude_sku_artcode_mapping").upsert({
+                            "my_sku": my_sku,
+                            "foneday_artcode": artcode_match,
+                            "foneday_sku": foneday_sku,
+                            "product_id": product_id,
+                            "mapping_score": 100,
+                            "last_verified_at": datetime.now().isoformat()
+                        }, on_conflict="my_sku,foneday_artcode").execute()
+                        
+                        total_mapped += 1
+                    except Exception as e:
+                        continue
             
             if idx % 50 == 0:
                 time.sleep(0.1)
@@ -890,8 +939,11 @@ elif page == "🔄 Import Individual (Pași)":
         - Accesează `GET /products` din API Foneday
         - Descarcă **TOATE produsele** disponibile (mii)
         - Salvează: `foneday_sku`, `artcode` (=SKU-ul tău), preț, stoc, etc.
+        - **NORMALIZARE artcode**: Dacă artcode e array `["GH82-18850B", "GH82-18835B"]`, extrage fiecare valoare separat
         
-        **Rezultat:** Tabel `claude_foneday_products` = o copie locală a catalogului Foneday
+        **Rezultat:** 
+        - Tabel `claude_foneday_products` = catalog complet
+        - Tabel `claude_foneday_artcodes_normalized` = fiecare artcode pe rând separat
         
         **Când:** O dată pe săptămână (catalogul Foneday nu se schimbă zilnic)
         
@@ -901,7 +953,7 @@ elif page == "🔄 Import Individual (Pași)":
         
         **Ce face:**
         - Ia fiecare SKU din catalogul tău
-        - Caută în Foneday unde `artcode` = SKU-ul tău
+        - Caută în tabelul normalizat unde `artcode` = SKU-ul tău
         - **Dacă găsește** → creează legătura: `my_sku` ↔ `foneday_artcode` ↔ `foneday_sku`
         
         **Rezultat:** Tabel `claude_sku_artcode_mapping` cu toate legăturile
@@ -944,7 +996,7 @@ elif page == "🔄 Import Individual (Pași)":
         
         **Prima rulare (setup):**
         1. Pasul 1 → Import WooCommerce
-        2. Pasul 2 → Import Foneday (durează mai mult)
+        2. Pasul 2 → Import Foneday + Normalizare (durează mai mult)
         3. Pasul 3 → Mapare SKU-uri
         
         **Zilnic (reaprovizionare):**
@@ -1254,5 +1306,5 @@ elif page == "📝 Log":
 
 
 st.sidebar.markdown("---")
-st.sidebar.caption("📦 ServicePack v3.3")
-st.sidebar.caption("Views catalog.* → public.v_*")
+st.sidebar.caption("📦 ServicePack v3.4")
+st.sidebar.caption("Normalizare artcode + Views catalog")

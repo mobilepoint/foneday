@@ -700,7 +700,6 @@ def find_high_profit_opportunities(min_profit_percent: float):
     opportunities = []
     
     try:
-        # Obține toate mapările
         mappings_result = supabase.table("claude_sku_artcode_mapping").select("*").execute()
         
         if not mappings_result.data:
@@ -717,7 +716,6 @@ def find_high_profit_opportunities(min_profit_percent: float):
             status_container.info(f"💰 Verific {idx+1}/{total_mappings}: {my_sku}")
             progress_bar.progress((idx + 1) / total_mappings)
             
-            # Obține prețul WooCommerce
             price_result = supabase.table("claude_woo_prices").select("regular_price").eq("sku", my_sku).execute()
             
             if not price_result.data:
@@ -728,7 +726,6 @@ def find_high_profit_opportunities(min_profit_percent: float):
             if woo_price <= 0:
                 continue
             
-            # Verifică prețul în Foneday
             foneday_product = get_foneday_product_by_sku(foneday_sku)
             
             if foneday_product and foneday_product.get("instock") == "Y":
@@ -738,13 +735,11 @@ def find_high_profit_opportunities(min_profit_percent: float):
                     profit_margin = calculate_profit_margin(foneday_price, woo_price)
                     
                     if profit_margin >= min_profit_percent:
-                        # Obține stocul actual
                         stock_result = supabase.table("claude_woo_stock").select("stock_quantity").eq("sku", my_sku).execute()
                         current_stock = 0
                         if stock_result.data:
                             current_stock = stock_result.data[0].get("stock_quantity", 0)
                         
-                        # Obține numele produsului
                         product_info = get_product_info_from_catalog(my_sku)
                         product_name = product_info["name"] if product_info else my_sku
                         
@@ -864,97 +859,198 @@ if page == "🏠 Dashboard":
 elif page == "🔄 Import Individual (Pași)":
     st.title("🔄 Import Individual - Alege Pașii")
     
-    st.markdown("""
-    ### Alege ce pași vrei să rulezi:
-    
-    - **Pasul 1**: 📥 Import WooCommerce (produse, prețuri, stocuri)
-    - **Pasul 2**: 🌐 Import TOATE produsele Foneday
-    - **Pasul 3**: 🗺️ Mapare SKU → artcode
-    - **Pasul 4**: 🔍 Verificare stoc/preț pentru produse cu stoc zero
-    - **Pasul 5**: 🛒 Adăugare în coș (2 bucăți) pentru produse profitabile
-    """)
+    # EXPLICAȚII DETALIATE
+    with st.expander("📚 **CITEȘTE MAI ÎNTÂI - Ce Face Fiecare Pas**", expanded=False):
+        st.markdown("""
+        ### **Pasul 1: 📥 Sincronizare WooCommerce**
+        
+        **Ce face:**
+        - Citește toate produsele din WooCommerce prin API
+        - Extrage: SKU, stoc, preț, ID produs
+        - Compară cu datele existente în Supabase
+        - **Produse noi** → le adaugă
+        - **Stoc/preț modificat** → le actualizează
+        - **Nemodificat** → le ignoră (eficiență maximă)
+        
+        **Rezultat:** Tabele `claude_woo_stock` și `claude_woo_prices` actualizate
+        
+        **Când:** Zilnic sau când modifici ceva în WooCommerce
+        
+        ---
+        
+        ### **Pasul 2: 🌐 Import Complet Catalog Foneday**
+        
+        **Ce face:**
+        - Accesează `GET /products` din API Foneday
+        - Descarcă **TOATE produsele** disponibile (mii)
+        - Salvează: `foneday_sku`, `artcode` (=SKU-ul tău), preț, stoc, etc.
+        
+        **Rezultat:** Tabel `claude_foneday_products` = o copie locală a catalogului Foneday
+        
+        **Când:** O dată pe săptămână (catalogul Foneday nu se schimbă zilnic)
+        
+        ---
+        
+        ### **Pasul 3: 🗺️ Mapare SKU-uri**
+        
+        **Ce face:**
+        - Ia fiecare SKU din catalogul tău
+        - Caută în Foneday unde `artcode` = SKU-ul tău
+        - **Dacă găsește** → creează legătura: `my_sku` ↔ `foneday_artcode` ↔ `foneday_sku`
+        
+        **Rezultat:** Tabel `claude_sku_artcode_mapping` cu toate legăturile
+        
+        **Când:** După Pașii 1 și 2, sau când adaugi produse noi
+        
+        ---
+        
+        ### **Pasul 4: 🔍 Verificare Stoc & Preț (Stoc Zero)**
+        
+        **Ce face:**
+        - Găsește produsele tale cu stoc zero
+        - Pentru fiecare: găsește maparea → verifică prin API Foneday (timp real)
+        - **Dacă e disponibil** → salvează în `claude_foneday_inventory`
+        
+        **Rezultat:** Știi ce produse cu stoc 0 poți reaproviziona
+        
+        **Când:** Zilnic pentru reaprovizionare
+        
+        ---
+        
+        ### **Pasul 5: 🛒 Adăugare Automată în Coș**
+        
+        **Ce face:**
+        - Ia produsele disponibile la Foneday (din inventar)
+        - Calculează marja de profit:
+          - Cost RON = Preț EUR × 5.1
+          - Preț vânzare fără TVA = Preț WooCommerce / 1.21
+          - Marjă = (1 - Cost/Preț vânzare) × 100%
+        - **Dacă profitabil (≥12%)** → adaugă **2 bucăți** în coșul Foneday
+        - **Dacă neprofitabil** → doar salvează în tabel
+        
+        **Rezultat:** Produse profitabile adăugate automat în coș, tu doar finalizezi comanda
+        
+        **Când:** După Pasul 4, când vrei să comanzi automat
+        
+        ---
+        
+        ### **🎯 Workflow Recomandat:**
+        
+        **Prima rulare (setup):**
+        1. Pasul 1 → Import WooCommerce
+        2. Pasul 2 → Import Foneday (durează mai mult)
+        3. Pasul 3 → Mapare SKU-uri
+        
+        **Zilnic (reaprovizionare):**
+        1. Pasul 1 → Actualizează stocuri/prețuri
+        2. Pasul 4 → Verifică stoc zero
+        3. Pasul 5 → Adaugă în coș
+        
+        **Săptămânal (optimizare):**
+        - 💰 Oportunități Profit (marjă mare)
+        """)
     
     st.markdown("---")
     
-    # Checkboxes individuale pentru fiecare pas
+    # Butoane individuale pentru fiecare pas
     col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
-        run_step1 = st.checkbox("✅ Pasul 1", value=False, key="step1_check")
-        if st.button("▶️ Rulează Pasul 1", use_container_width=True):
+        st.markdown("### Pasul 1")
+        st.caption("📥 Import WooCommerce")
+        if st.button("▶️ Rulează", key="btn_step1", use_container_width=True):
             st.markdown("## 📥 PASUL 1: Import WooCommerce")
             new, updated, unchanged, errors = step1_import_woocommerce()
-            st.success(f"✅ PASUL 1 complet: {new} noi, {updated} actualizate, {unchanged} neschimbate")
+            st.success(f"✅ Complet: {new} noi, {updated} actualizate")
     
     with col2:
-        run_step2 = st.checkbox("✅ Pasul 2", value=False, key="step2_check")
-        if st.button("▶️ Rulează Pasul 2", use_container_width=True):
+        st.markdown("### Pasul 2")
+        st.caption("🌐 Import Foneday")
+        if st.button("▶️ Rulează", key="btn_step2", use_container_width=True):
             st.markdown("## 🌐 PASUL 2: Import Foneday")
             total_foneday = step2_import_foneday_all_products()
-            st.success(f"✅ PASUL 2 complet: {total_foneday} produse")
+            st.success(f"✅ Complet: {total_foneday} produse")
     
     with col3:
-        run_step3 = st.checkbox("✅ Pasul 3", value=False, key="step3_check")
-        if st.button("▶️ Rulează Pasul 3", use_container_width=True):
-            st.markdown("## 🗺️ PASUL 3: Mapare SKU")
+        st.markdown("### Pasul 3")
+        st.caption("🗺️ Mapare SKU")
+        if st.button("▶️ Rulează", key="btn_step3", use_container_width=True):
+            st.markdown("## 🗺️ PASUL 3: Mapare")
             total_mapped = step3_map_sku_to_artcode()
-            st.success(f"✅ PASUL 3 complet: {total_mapped} mapări")
+            st.success(f"✅ Complet: {total_mapped} mapări")
     
     with col4:
-        run_step4 = st.checkbox("✅ Pasul 4", value=False, key="step4_check")
-        if st.button("▶️ Rulează Pasul 4", use_container_width=True):
-            st.markdown("## 🔍 PASUL 4: Verificare Stoc")
+        st.markdown("### Pasul 4")
+        st.caption("🔍 Verificare Stoc")
+        if st.button("▶️ Rulează", key="btn_step4", use_container_width=True):
+            st.markdown("## 🔍 PASUL 4: Verificare")
             checked, available = step4_check_stock_and_prices()
-            st.success(f"✅ PASUL 4 complet: {checked} verificate, {available} disponibile")
+            st.success(f"✅ Complet: {available} disponibile")
     
     with col5:
-        run_step5 = st.checkbox("✅ Pasul 5", value=False, key="step5_check")
-        if st.button("▶️ Rulează Pasul 5", use_container_width=True):
-            st.markdown("## 🛒 PASUL 5: Adăugare Coș")
+        st.markdown("### Pasul 5")
+        st.caption("🛒 Adăugare Coș")
+        if st.button("▶️ Rulează", key="btn_step5", use_container_width=True):
+            st.markdown("## 🛒 PASUL 5: Coș")
             added, not_profitable = step5_add_to_cart()
-            st.success(f"✅ PASUL 5 complet: {added} adăugate, {not_profitable} neprofitabile")
+            st.success(f"✅ Complet: {added} adăugate")
     
     st.markdown("---")
     
-    # Buton pentru a rula toți pașii selectați
-    if st.button("▶️ RULEAZĂ TOȚI PAȘII SELECTAȚI", type="primary", use_container_width=True):
+    # Opțiune de a rula mai mulți pași
+    st.markdown("### Sau alege mai mulți pași:")
+    
+    col1, col2, col3, col4, col5 = st.columns(5)
+    
+    with col1:
+        run_step1 = st.checkbox("Pasul 1", value=False)
+    with col2:
+        run_step2 = st.checkbox("Pasul 2", value=False)
+    with col3:
+        run_step3 = st.checkbox("Pasul 3", value=False)
+    with col4:
+        run_step4 = st.checkbox("Pasul 4", value=False)
+    with col5:
+        run_step5 = st.checkbox("Pasul 5", value=False)
+    
+    if st.button("▶️ RULEAZĂ PAȘII SELECTAȚI", type="primary", use_container_width=True):
         
         start_time = datetime.now()
         
         if run_step1:
             st.markdown("## 📥 PASUL 1: Import WooCommerce")
             new, updated, unchanged, errors = step1_import_woocommerce()
-            st.success(f"✅ PASUL 1 complet: {new} noi, {updated} actualizate")
+            st.success(f"✅ PASUL 1: {new} noi, {updated} actualizate")
             st.markdown("---")
         
         if run_step2:
             st.markdown("## 🌐 PASUL 2: Import Foneday")
             total_foneday = step2_import_foneday_all_products()
-            st.success(f"✅ PASUL 2 complet: {total_foneday} produse")
+            st.success(f"✅ PASUL 2: {total_foneday} produse")
             st.markdown("---")
         
         if run_step3:
-            st.markdown("## 🗺️ PASUL 3: Mapare SKU")
+            st.markdown("## 🗺️ PASUL 3: Mapare")
             total_mapped = step3_map_sku_to_artcode()
-            st.success(f"✅ PASUL 3 complet: {total_mapped} mapări")
+            st.success(f"✅ PASUL 3: {total_mapped} mapări")
             st.markdown("---")
         
         if run_step4:
-            st.markdown("## 🔍 PASUL 4: Verificare Stoc")
+            st.markdown("## 🔍 PASUL 4: Verificare")
             checked, available = step4_check_stock_and_prices()
-            st.success(f"✅ PASUL 4 complet: {checked} verificate, {available} disponibile")
+            st.success(f"✅ PASUL 4: {available} disponibile")
             st.markdown("---")
         
         if run_step5:
-            st.markdown("## 🛒 PASUL 5: Adăugare Coș")
+            st.markdown("## 🛒 PASUL 5: Coș")
             added, not_profitable = step5_add_to_cart()
-            st.success(f"✅ PASUL 5 complet: {added} adăugate")
+            st.success(f"✅ PASUL 5: {added} adăugate")
         
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
         
         st.markdown("---")
-        st.success(f"🎉 **Finalizat în {duration:.0f} secunde ({duration/60:.1f} minute)!**")
+        st.success(f"🎉 **Finalizat în {duration:.0f}s ({duration/60:.1f} min)!**")
 
 
 elif page == "💰 Oportunități Profit":
@@ -976,7 +1072,6 @@ elif page == "💰 Oportunități Profit":
     
     st.markdown("---")
     
-    # Setare marjă minimă de profit
     min_profit = st.slider(
         "Setează marja minimă de profit (%)",
         min_value=15,
@@ -997,13 +1092,9 @@ elif page == "💰 Oportunități Profit":
         if opportunities:
             st.success(f"🎉 Găsite {len(opportunities)} oportunități de profit ≥{min_profit}%!")
             
-            # Creează DataFrame
             df = pd.DataFrame(opportunities)
-            
-            # Sortează după marjă de profit descrescător
             df = df.sort_values("profit_margin", ascending=False)
             
-            # Afișează tabel
             st.dataframe(
                 df[[
                     "sku", "product_name", "woo_price_ron", "foneday_price_eur",
@@ -1013,7 +1104,6 @@ elif page == "💰 Oportunități Profit":
                 height=500
             )
             
-            # Statistici
             st.markdown("---")
             col1, col2, col3, col4 = st.columns(4)
             
@@ -1032,7 +1122,6 @@ elif page == "💰 Oportunități Profit":
                 with_stock = len(df[df["current_stock"] > 0])
                 st.metric("📦 Cu Stoc Existent", with_stock)
             
-            # Export CSV
             st.markdown("---")
             if st.button("📥 Exportă Oportunități (CSV)"):
                 csv = df.to_csv(index=False)
@@ -1159,5 +1248,5 @@ elif page == "📝 Log":
 
 
 st.sidebar.markdown("---")
-st.sidebar.caption("📦 ServicePack v3.1")
-st.sidebar.caption("5 Pași Individuali + Oportunități Profit")
+st.sidebar.caption("📦 ServicePack v3.2")
+st.sidebar.caption("5 Pași Individuali + Explicații + Oportunități")

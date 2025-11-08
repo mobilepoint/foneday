@@ -45,7 +45,7 @@ wcapi = API(
 
 
 def log_event(event_type: str, message: str, sku: str = None, 
-              product_id: str = None, status: str = "info", payload: dict = None):
+              product_id: str = None, status: str = "info"):
     """Salvează evenimente în log"""
     try:
         supabase.table("claude_sync_logs").insert({
@@ -53,8 +53,7 @@ def log_event(event_type: str, message: str, sku: str = None,
             "sku": sku,
             "product_id": product_id,
             "message": message,
-            "status": status,
-            "payload": payload
+            "status": status
         }).execute()
     except Exception as e:
         print(f"Error logging: {e}")
@@ -126,8 +125,61 @@ def add_to_foneday_cart(sku: str, quantity: int, note: str = None):
         return None
 
 
+def get_product_info_from_catalog(sku: str):
+    """Obține informații produs din schema catalog"""
+    try:
+        # Încearcă să găsești produsul în product_sku din catalog
+        result = supabase.table("product_sku").select(
+            "product_id, is_primary"
+        ).eq("sku", sku).eq("is_primary", True).limit(1).execute()
+        
+        if result.data and len(result.data) > 0:
+            product_id = result.data[0]["product_id"]
+            
+            # Încearcă să găsești numele produsului
+            product_result = supabase.table("product").select("name").eq("id", product_id).limit(1).execute()
+            
+            if product_result.data and len(product_result.data) > 0:
+                return {
+                    "product_id": product_id,
+                    "name": product_result.data[0]["name"]
+                }
+            
+            return {"product_id": product_id, "name": sku}
+        
+        return None
+    except Exception as e:
+        return None
+
+
+def get_all_skus_for_sku(sku: str):
+    """Obține toate SKU-urile (inclusiv secundare) pentru un SKU dat"""
+    try:
+        # Găsește product_id pentru SKU-ul dat
+        result = supabase.table("product_sku").select(
+            "product_id"
+        ).eq("sku", sku).eq("is_primary", True).limit(1).execute()
+        
+        if not result.data or len(result.data) == 0:
+            return [{"sku": sku, "is_primary": True}]
+        
+        product_id = result.data[0]["product_id"]
+        
+        # Găsește toate SKU-urile pentru acest product_id
+        all_skus_result = supabase.table("product_sku").select(
+            "sku, is_primary"
+        ).eq("product_id", product_id).execute()
+        
+        if all_skus_result.data:
+            return all_skus_result.data
+        
+        return [{"sku": sku, "is_primary": True}]
+    except Exception as e:
+        return [{"sku": sku, "is_primary": True}]
+
+
 def sync_woocommerce_products():
-    """Sincronizează stocuri și prețuri din WooCommerce"""
+    """Sincronizează produse din WooCommerce"""
     page = 1
     per_page = 100
     total_synced = 0
@@ -160,36 +212,39 @@ def sync_woocommerce_products():
                     if not sku:
                         continue
                     
-                    # Găsește produsul în Supabase
-                    result = supabase.table("product_sku").select(
-                        "product_id"
-                    ).eq("sku", sku).eq("is_primary", True).execute()
+                    # Încearcă să găsești product_id din catalog
+                    product_info = get_product_info_from_catalog(sku)
+                    product_id = product_info["product_id"] if product_info else None
                     
-                    if not result.data or len(result.data) == 0:
-                        continue
-                    
-                    product_id = result.data[0]["product_id"]
                     stock_quantity = product.get("stock_quantity", 0)
                     regular_price = product.get("regular_price", "0")
                     woo_product_id = product.get("id")
                     
                     # Sincronizează stocul
-                    supabase.table("claude_woo_stock").upsert({
-                        "product_id": product_id,
+                    stock_data = {
                         "sku": sku,
                         "stock_quantity": stock_quantity if stock_quantity is not None else 0,
                         "woo_product_id": woo_product_id,
                         "last_sync_at": datetime.now().isoformat()
-                    }, on_conflict="sku").execute()
+                    }
+                    
+                    if product_id:
+                        stock_data["product_id"] = product_id
+                    
+                    supabase.table("claude_woo_stock").upsert(stock_data, on_conflict="sku").execute()
                     
                     # Sincronizează prețul
-                    supabase.table("claude_woo_prices").upsert({
-                        "product_id": product_id,
+                    price_data = {
                         "sku": sku,
                         "regular_price": float(regular_price) if regular_price else 0,
                         "woo_product_id": woo_product_id,
                         "last_sync_at": datetime.now().isoformat()
-                    }, on_conflict="sku").execute()
+                    }
+                    
+                    if product_id:
+                        price_data["product_id"] = product_id
+                    
+                    supabase.table("claude_woo_prices").upsert(price_data, on_conflict="sku").execute()
                     
                     total_synced += 1
                     
@@ -221,13 +276,12 @@ def check_zero_stock_and_add_to_cart():
     progress_bar = st.progress(0)
     
     # Găsește toate produsele cu stoc zero
-    stock_result = supabase.table("claude_woo_stock").select(
-        "*, product_sku!inner(product_id, sku, is_primary, product(name))"
-    ).lte("stock_quantity", 0).execute()
+    stock_result = supabase.table("claude_woo_stock").select("*").lte("stock_quantity", 0).execute()
     
     if not stock_result.data or len(stock_result.data) == 0:
         status_container.success("✅ Nu există produse cu stoc zero!")
         log_event("foneday_check", "Nu există produse cu stoc zero", status="info")
+        progress_bar.empty()
         return 0, 0, 0
     
     zero_stock_products = stock_result.data
@@ -241,21 +295,19 @@ def check_zero_stock_and_add_to_cart():
     for idx, product_data in enumerate(zero_stock_products):
         try:
             sku = product_data.get("sku")
-            product_id = product_data["product_sku"]["product_id"]
-            product_name = product_data["product_sku"]["product"]["name"]
+            product_id = product_data.get("product_id")
+            
+            # Încearcă să găsești informații despre produs
+            product_info = get_product_info_from_catalog(sku) if not product_id else None
+            
+            if product_info:
+                product_id = product_info["product_id"]
+                product_name = product_info["name"]
+            else:
+                product_name = sku
             
             status_container.info(f"🔍 Verificare: {product_name} ({idx+1}/{total_products})")
             progress_bar.progress((idx + 1) / total_products)
-            
-            # Obține toate SKU-urile produsului
-            all_skus_result = supabase.table("product_sku").select("sku, is_primary").eq(
-                "product_id", product_id
-            ).execute()
-            
-            if not all_skus_result.data:
-                continue
-            
-            all_skus = all_skus_result.data
             
             # Obține prețul WooCommerce
             price_result = supabase.table("claude_woo_prices").select("regular_price").eq(
@@ -265,10 +317,13 @@ def check_zero_stock_and_add_to_cart():
             if not price_result.data or len(price_result.data) == 0:
                 continue
             
-            woo_price = float(price_result.data[0]["regular_price"])
+            woo_price = float(price_result.data[0].get("regular_price", 0))
             
             if woo_price <= 0:
                 continue
+            
+            # Obține toate SKU-urile pentru produs (inclusiv secundare)
+            all_skus = get_all_skus_for_sku(sku)
             
             # Caută la Foneday pe toate SKU-urile
             foneday_options = []
@@ -289,8 +344,7 @@ def check_zero_stock_and_add_to_cart():
                         })
                         
                         # Salvează în inventar
-                        supabase.table("claude_foneday_inventory").upsert({
-                            "product_id": product_id,
+                        inventory_data = {
                             "sku": sku,
                             "foneday_sku": sku_to_check,
                             "price_eur": foneday_price,
@@ -298,7 +352,15 @@ def check_zero_stock_and_add_to_cart():
                             "title": foneday_product.get("title"),
                             "quality": foneday_product.get("quality"),
                             "last_checked_at": datetime.now().isoformat()
-                        }, on_conflict="sku,foneday_sku").execute()
+                        }
+                        
+                        if product_id:
+                            inventory_data["product_id"] = product_id
+                        
+                        supabase.table("claude_foneday_inventory").upsert(
+                            inventory_data, 
+                            on_conflict="sku,foneday_sku"
+                        ).execute()
                 
                 time.sleep(0.2)  # Rate limiting Foneday API
             
@@ -335,8 +397,7 @@ def check_zero_stock_and_add_to_cart():
                 
                 if cart_result:
                     # Salvează în tabel
-                    supabase.table("claude_foneday_cart").insert({
-                        "product_id": product_id,
+                    cart_data = {
                         "sku": sku,
                         "foneday_sku": foneday_sku,
                         "quantity": 1,
@@ -346,7 +407,12 @@ def check_zero_stock_and_add_to_cart():
                         "is_profitable": True,
                         "status": "added_to_cart",
                         "note": f"Import automat - Profit: {profit_margin}%"
-                    }).execute()
+                    }
+                    
+                    if product_id:
+                        cart_data["product_id"] = product_id
+                    
+                    supabase.table("claude_foneday_cart").insert(cart_data).execute()
                     
                     added_to_cart += 1
                     log_event("cart_add", f"Adăugat în coș: {product_name} - Profit: {profit_margin}%", 
@@ -358,8 +424,7 @@ def check_zero_stock_and_add_to_cart():
                 not_profitable += 1
                 
                 # Salvează ca neprofitabil
-                supabase.table("claude_foneday_cart").insert({
-                    "product_id": product_id,
+                cart_data = {
                     "sku": sku,
                     "foneday_sku": foneday_sku,
                     "quantity": 1,
@@ -369,7 +434,12 @@ def check_zero_stock_and_add_to_cart():
                     "is_profitable": False,
                     "status": "not_profitable",
                     "note": f"Neprofitabil - Marjă: {profit_margin}%"
-                }).execute()
+                }
+                
+                if product_id:
+                    cart_data["product_id"] = product_id
+                
+                supabase.table("claude_foneday_cart").insert(cart_data).execute()
                 
                 log_event("foneday_check", f"Neprofitabil: {product_name} - Marjă: {profit_margin}%", 
                          sku=sku, status="warning")
@@ -413,54 +483,72 @@ if page == "🏠 Dashboard":
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        stock_count = supabase.table("claude_woo_stock").select("*", count="exact").gt("stock_quantity", 0).execute()
-        st.metric("✅ Cu Stoc", stock_count.count if stock_count.count else 0)
+        try:
+            stock_count = supabase.table("claude_woo_stock").select("*", count="exact").gt("stock_quantity", 0).execute()
+            st.metric("✅ Cu Stoc", stock_count.count if stock_count.count else 0)
+        except:
+            st.metric("✅ Cu Stoc", "N/A")
     
     with col2:
-        zero_count = supabase.table("claude_woo_stock").select("*", count="exact").lte("stock_quantity", 0).execute()
-        st.metric("❌ Stoc Zero", zero_count.count if zero_count.count else 0)
+        try:
+            zero_count = supabase.table("claude_woo_stock").select("*", count="exact").lte("stock_quantity", 0).execute()
+            st.metric("❌ Stoc Zero", zero_count.count if zero_count.count else 0)
+        except:
+            st.metric("❌ Stoc Zero", "N/A")
     
     with col3:
-        cart_count = supabase.table("claude_foneday_cart").select("*", count="exact").eq("status", "added_to_cart").execute()
-        st.metric("🛒 În Coș Foneday", cart_count.count if cart_count.count else 0)
+        try:
+            cart_count = supabase.table("claude_foneday_cart").select("*", count="exact").eq("status", "added_to_cart").execute()
+            st.metric("🛒 În Coș Foneday", cart_count.count if cart_count.count else 0)
+        except:
+            st.metric("🛒 În Coș Foneday", "N/A")
     
     with col4:
-        unprofitable = supabase.table("claude_foneday_cart").select("*", count="exact").eq("is_profitable", False).execute()
-        st.metric("⚠️ Neprofitabile", unprofitable.count if unprofitable.count else 0)
+        try:
+            unprofitable = supabase.table("claude_foneday_cart").select("*", count="exact").eq("is_profitable", False).execute()
+            st.metric("⚠️ Neprofitabile", unprofitable.count if unprofitable.count else 0)
+        except:
+            st.metric("⚠️ Neprofitabile", "N/A")
     
     st.markdown("---")
     
     # Ultimele sincronizări
     st.markdown("### 🕐 Ultima Sincronizare")
     
-    last_sync = supabase.table("claude_sync_logs").select("created_at, message").eq(
-        "event_type", "sync_complete"
-    ).order("created_at", desc=True).limit(1).execute()
-    
-    if last_sync.data and len(last_sync.data) > 0:
-        last_time = pd.to_datetime(last_sync.data[0]["created_at"]).strftime("%Y-%m-%d %H:%M:%S")
-        st.info(f"⏰ Ultima sincronizare: **{last_time}**")
-        st.caption(last_sync.data[0]["message"])
-    else:
-        st.warning("⚠️ Nicio sincronizare încă")
+    try:
+        last_sync = supabase.table("claude_sync_logs").select("created_at, message").eq(
+            "event_type", "sync_complete"
+        ).order("created_at", desc=True).limit(1).execute()
+        
+        if last_sync.data and len(last_sync.data) > 0:
+            last_time = pd.to_datetime(last_sync.data[0]["created_at"]).strftime("%Y-%m-%d %H:%M:%S")
+            st.info(f"⏰ Ultima sincronizare: **{last_time}**")
+            st.caption(last_sync.data[0]["message"])
+        else:
+            st.warning("⚠️ Nicio sincronizare încă")
+    except Exception as e:
+        st.warning(f"Nu s-au putut încărca datele sincronizării: {e}")
     
     st.markdown("---")
     
     # Ultimele evenimente
     st.markdown("### 📋 Ultimele Evenimente")
     
-    logs = supabase.table("claude_sync_logs").select("*").order("created_at", desc=True).limit(15).execute()
-    
-    if logs.data:
-        df = pd.DataFrame(logs.data)
-        df["created_at"] = pd.to_datetime(df["created_at"]).dt.strftime("%Y-%m-%d %H:%M:%S")
-        st.dataframe(
-            df[["created_at", "event_type", "sku", "message", "status"]],
-            use_container_width=True,
-            height=350
-        )
-    else:
-        st.info("Nu există evenimente înregistrate")
+    try:
+        logs = supabase.table("claude_sync_logs").select("*").order("created_at", desc=True).limit(15).execute()
+        
+        if logs.data:
+            df = pd.DataFrame(logs.data)
+            df["created_at"] = pd.to_datetime(df["created_at"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+            st.dataframe(
+                df[["created_at", "event_type", "sku", "message", "status"]],
+                use_container_width=True,
+                height=350
+            )
+        else:
+            st.info("Nu există evenimente înregistrate")
+    except Exception as e:
+        st.error(f"Eroare la încărcarea log-urilor: {e}")
 
 
 elif page == "🔄 Import Zilnic":
@@ -532,101 +620,100 @@ elif page == "🔄 Import Zilnic":
 elif page == "📊 Stocuri Critice":
     st.title("⚠️ Produse cu Stoc Zero")
     
-    critical = supabase.table("claude_v_critical_stock").select("*").execute()
-    
-    if critical.data and len(critical.data) > 0:
-        df = pd.DataFrame(critical.data)
+    try:
+        critical = supabase.table("claude_v_critical_stock").select("*").execute()
         
-        st.metric("📊 Total Produse Stoc Zero", len(df))
-        
-        st.markdown("---")
-        
-        # Filtre
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            show_available = st.checkbox("Doar disponibile la Foneday", value=False)
-        
-        with col2:
-            show_profitable = st.checkbox("Doar profitabile (≥12%)", value=False)
-        
-        filtered = df.copy()
-        
-        if show_available:
-            filtered = filtered[filtered["foneday_instock"] == True]
-        
-        if show_profitable:
-            filtered = filtered[filtered["profit_margin_percent"] >= 12]
-        
-        st.dataframe(
-            filtered[[
-                "sku", "name", "stock_quantity", "woo_price_ron",
-                "foneday_sku", "foneday_price_eur", "foneday_instock",
-                "profit_margin_percent"
-            ]],
-            use_container_width=True,
-            height=500
-        )
-    else:
-        st.success("✅ Nu există produse cu stoc zero!")
+        if critical.data and len(critical.data) > 0:
+            df = pd.DataFrame(critical.data)
+            
+            st.metric("📊 Total Produse Stoc Zero", len(df))
+            
+            st.markdown("---")
+            
+            # Filtre
+            col1, col2 = st.columns(2)
+            
+            with col1:
+                show_available = st.checkbox("Doar disponibile la Foneday", value=False)
+            
+            with col2:
+                show_profitable = st.checkbox("Doar profitabile (≥12%)", value=False)
+            
+            filtered = df.copy()
+            
+            if show_available:
+                filtered = filtered[filtered["foneday_instock"] == True]
+            
+            if show_profitable:
+                filtered = filtered[filtered["profit_margin_percent"] >= 12]
+            
+            st.dataframe(
+                filtered[[
+                    "sku", "name", "stock_quantity", "woo_price_ron",
+                    "foneday_sku", "foneday_price_eur", "foneday_instock",
+                    "profit_margin_percent"
+                ]],
+                use_container_width=True,
+                height=500
+            )
+        else:
+            st.success("✅ Nu există produse cu stoc zero!")
+    except Exception as e:
+        st.error(f"Eroare la încărcarea stocurilor critice: {e}")
 
 
 elif page == "🛒 Coș Foneday":
     st.title("🛒 Produse în Coșul Foneday")
     
-    cart = supabase.table("claude_foneday_cart").select(
-        "*, product(name)"
-    ).order("created_at", desc=True).limit(200).execute()
-    
-    if cart.data and len(cart.data) > 0:
-        df = pd.DataFrame(cart.data)
+    try:
+        cart = supabase.table("claude_foneday_cart").select("*").order("created_at", desc=True).limit(200).execute()
         
-        if "product" in df.columns:
-            df["product_name"] = df["product"].apply(
-                lambda x: x.get("name") if isinstance(x, dict) else ""
+        if cart.data and len(cart.data) > 0:
+            df = pd.DataFrame(cart.data)
+            
+            # Filtre status
+            status_options = df["status"].unique().tolist()
+            selected_status = st.multiselect(
+                "Filtrează după status",
+                options=status_options,
+                default=status_options
             )
-        
-        # Filtre status
-        status_options = df["status"].unique().tolist()
-        selected_status = st.multiselect(
-            "Filtrează după status",
-            options=status_options,
-            default=status_options
-        )
-        
-        filtered = df[df["status"].isin(selected_status)]
-        
-        st.dataframe(
-            filtered[[
-                "created_at", "sku", "product_name", "foneday_sku",
-                "quantity", "price_eur", "woo_price_ron",
-                "profit_margin", "is_profitable", "status", "note"
-            ]],
-            use_container_width=True,
-            height=500
-        )
-        
-        # Statistici
-        st.markdown("---")
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            total_value = (filtered["price_eur"] * filtered["quantity"]).sum()
-            st.metric("💰 Valoare Totală (EUR)", f"€{total_value:.2f}")
-        
-        with col2:
-            profitable_df = filtered[filtered["is_profitable"] == True]
-            if len(profitable_df) > 0:
-                avg_margin = profitable_df["profit_margin"].mean()
-                st.metric("📈 Marjă Medie", f"{avg_margin:.2f}%")
-            else:
-                st.metric("📈 Marjă Medie", "N/A")
-        
-        with col3:
-            total_items = filtered["quantity"].sum()
-            st.metric("📦 Total Articole", int(total_items))
-    else:
-        st.info("Nu există produse în coș")
+            
+            filtered = df[df["status"].isin(selected_status)]
+            
+            st.dataframe(
+                filtered[[
+                    "created_at", "sku", "foneday_sku",
+                    "quantity", "price_eur", "woo_price_ron",
+                    "profit_margin", "is_profitable", "status", "note"
+                ]],
+                use_container_width=True,
+                height=500
+            )
+            
+            # Statistici
+            st.markdown("---")
+            col1, col2, col3 = st.columns(3)
+            
+            with col1:
+                total_value = (filtered["price_eur"] * filtered["quantity"]).sum()
+                st.metric("💰 Valoare Totală (EUR)", f"€{total_value:.2f}")
+            
+            with col2:
+                profitable_df = filtered[filtered["is_profitable"] == True]
+                if len(profitable_df) > 0:
+                    avg_margin = profitable_df["profit_margin"].mean()
+                    st.metric("📈 Marjă Medie", f"{avg_margin:.2f}%")
+                else:
+                    st.metric("📈 Marjă Medie", "N/A")
+            
+            with col3:
+                total_items = filtered["quantity"].sum()
+                st.metric("📦 Total Articole", int(total_items))
+        else:
+            st.info("Nu există produse în coș")
+    except Exception as e:
+        st.error(f"Eroare la încărcarea coșului: {e}")
 
 
 elif page == "📝 Istoric Log":
@@ -635,7 +722,7 @@ elif page == "📝 Istoric Log":
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        event_types = ["Toate"] + ["sync_start", "sync_complete", "foneday_check", "cart_add", "error"]
+        event_types = ["Toate", "sync_start", "sync_complete", "foneday_check", "cart_add", "error"]
         selected_event = st.selectbox("Tip Eveniment", event_types)
     
     with col2:
@@ -646,40 +733,43 @@ elif page == "📝 Istoric Log":
         limit = st.number_input("Număr rezultate", min_value=10, max_value=500, value=100, step=10)
     
     # Query
-    query = supabase.table("claude_sync_logs").select("*")
-    
-    if selected_event != "Toate":
-        query = query.eq("event_type", selected_event)
-    
-    if selected_status != "Toate":
-        query = query.eq("status", selected_status)
-    
-    logs = query.order("created_at", desc=True).limit(limit).execute()
-    
-    if logs.data and len(logs.data) > 0:
-        df = pd.DataFrame(logs.data)
-        df["created_at"] = pd.to_datetime(df["created_at"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        query = supabase.table("claude_sync_logs").select("*")
         
-        st.dataframe(
-            df[["created_at", "event_type", "sku", "message", "status"]],
-            use_container_width=True,
-            height=500
-        )
+        if selected_event != "Toate":
+            query = query.eq("event_type", selected_event)
         
-        # Export
-        if st.button("📥 Exportă CSV"):
-            csv = df.to_csv(index=False)
-            st.download_button(
-                label="⬇️ Descarcă Log-uri",
-                data=csv,
-                file_name=f"logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-                mime="text/csv"
+        if selected_status != "Toate":
+            query = query.eq("status", selected_status)
+        
+        logs = query.order("created_at", desc=True).limit(limit).execute()
+        
+        if logs.data and len(logs.data) > 0:
+            df = pd.DataFrame(logs.data)
+            df["created_at"] = pd.to_datetime(df["created_at"]).dt.strftime("%Y-%m-%d %H:%M:%S")
+            
+            st.dataframe(
+                df[["created_at", "event_type", "sku", "message", "status"]],
+                use_container_width=True,
+                height=500
             )
-    else:
-        st.info("Nu există log-uri pentru filtrele selectate")
+            
+            # Export
+            if st.button("📥 Exportă CSV"):
+                csv = df.to_csv(index=False)
+                st.download_button(
+                    label="⬇️ Descarcă Log-uri",
+                    data=csv,
+                    file_name=f"logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                    mime="text/csv"
+                )
+        else:
+            st.info("Nu există log-uri pentru filtrele selectate")
+    except Exception as e:
+        st.error(f"Eroare la încărcarea log-urilor: {e}")
 
 
 # Footer
 st.sidebar.markdown("---")
 st.sidebar.caption("📦 ServicePack Stock Sync v2.0")
-st.sidebar.caption("Creat cu ❤️ de Claude & Perplexity")
+st.sidebar.caption("Powered by Streamlit & Supabase")

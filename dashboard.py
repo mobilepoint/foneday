@@ -518,9 +518,9 @@ def step2_import_foneday_all_products():
         return 0
 
 
-# ============ PASUL 3: Mapare SKU → artcode (OPTIMIZAT) ============
+# ============ PASUL 3: Mapare SKU → artcode (FIX COMPLET) ============
 def step3_map_sku_to_artcode():
-    """PASUL 3: Mapare SKU-uri optimizată (fără loop lent)"""
+    """PASUL 3: Mapare SKU-uri optimizată cu pagination"""
     
     progress_bar = st.progress(0)
     status_container = st.empty()
@@ -528,40 +528,76 @@ def step3_map_sku_to_artcode():
     log_event("step3_start", "PASUL 3: Începe mapare SKU → artcode", status="info")
     
     try:
-        status_container.info("📂 PASUL 3: Citesc SKU-uri din catalog...")
-        progress_bar.progress(0.2)
+        status_container.info("📂 PASUL 3: Citesc toate SKU-urile din catalog...")
         
-        # Citește TOATE SKU-urile primary dintr-o dată
-        my_skus_result = supabase.table("v_product_sku").select(
-            "sku, product_id"
-        ).eq("is_primary", True).execute()
+        # Citește TOATE SKU-urile cu pagination (pentru a nu pierde date)
+        all_my_skus = []
+        page_size = 1000
+        page = 0
         
-        if not my_skus_result.data:
+        while True:
+            result = supabase.table("v_product_sku").select(
+                "sku, product_id"
+            ).eq("is_primary", True).range(
+                page * page_size, 
+                (page + 1) * page_size - 1
+            ).execute()
+            
+            if not result.data or len(result.data) == 0:
+                break
+            
+            all_my_skus.extend(result.data)
+            page += 1
+            
+            status_container.info(f"📂 Citite {len(all_my_skus)} SKU-uri din catalog...")
+            
+            if len(result.data) < page_size:
+                break
+        
+        if not all_my_skus:
             st.warning("Nu există SKU-uri de mapat")
             return 0
         
-        my_skus = my_skus_result.data
-        status_container.success(f"✅ Găsite {len(my_skus)} SKU-uri în catalog")
+        status_container.success(f"✅ Total {len(all_my_skus)} SKU-uri în catalog")
+        progress_bar.progress(0.3)
         
-        progress_bar.progress(0.4)
-        status_container.info("📂 Citesc artcode-uri Foneday...")
+        status_container.info("📂 Citesc toate artcode-urile Foneday...")
         
-        # Citește TOATE artcode-urile normalizate dintr-o dată
-        artcodes_result = supabase.table("claude_foneday_artcodes_normalized").select("*").execute()
+        # Citește TOATE artcode-urile cu pagination
+        all_artcodes = []
+        page = 0
         
-        if not artcodes_result.data:
+        while True:
+            result = supabase.table("claude_foneday_artcodes_normalized").select(
+                "*"
+            ).range(
+                page * page_size, 
+                (page + 1) * page_size - 1
+            ).execute()
+            
+            if not result.data or len(result.data) == 0:
+                break
+            
+            all_artcodes.extend(result.data)
+            page += 1
+            
+            status_container.info(f"📂 Citite {len(all_artcodes)} artcode-uri Foneday...")
+            
+            if len(result.data) < page_size:
+                break
+        
+        if not all_artcodes:
             st.warning("Nu există artcode-uri Foneday")
             return 0
         
-        artcodes = artcodes_result.data
-        status_container.success(f"✅ Găsite {len(artcodes)} artcode-uri Foneday")
-        
+        status_container.success(f"✅ Total {len(all_artcodes)} artcode-uri Foneday")
         progress_bar.progress(0.6)
+        
         status_container.info("🔗 Creez mapări în memorie...")
         
-        # Creează un dict pentru lookup O(1) în loc de O(n)
+        # Creează dict pentru lookup O(1)
         artcode_dict = {}
-        for item in artcodes:
+        for item in all_artcodes:
             artcode = item["artcode"]
             if artcode not in artcode_dict:
                 artcode_dict[artcode] = []
@@ -570,13 +606,12 @@ def step3_map_sku_to_artcode():
                 "artcode": item["artcode"]
             })
         
-        # Creează toate mapările în memorie
+        # Creează toate mapările
         batch_mappings = []
-        for sku_item in my_skus:
+        for sku_item in all_my_skus:
             my_sku = sku_item["sku"]
             product_id = sku_item["product_id"]
             
-            # Lookup O(1) în loc de query database
             if my_sku in artcode_dict:
                 for foneday_match in artcode_dict[my_sku]:
                     batch_mappings.append({
@@ -589,17 +624,23 @@ def step3_map_sku_to_artcode():
                     })
         
         status_container.success(f"✅ Create {len(batch_mappings)} mapări în memorie")
-        
         progress_bar.progress(0.8)
-        status_container.info("💾 Salvez mapări în baza de date...")
         
-        # Inserează în batch-uri de 500 (limita Supabase)
+        if not batch_mappings:
+            st.warning("Nu s-au găsit match-uri între SKU-uri și Foneday")
+            return 0
+        
+        status_container.info("💾 Salvez mapări (FĂRĂ să șterg cele vechi)...")
+        
+        # Inserează în batch-uri de 500
         total_saved = 0
         batch_size = 500
+        errors = 0
         
         for i in range(0, len(batch_mappings), batch_size):
             batch = batch_mappings[i:i+batch_size]
             try:
+                # UPSERT = INSERT + UPDATE dacă există
                 supabase.table("claude_sku_artcode_mapping").upsert(
                     batch,
                     on_conflict="my_sku,foneday_artcode"
@@ -607,20 +648,31 @@ def step3_map_sku_to_artcode():
                 total_saved += len(batch)
                 status_container.info(f"💾 Salvate {total_saved}/{len(batch_mappings)} mapări...")
             except Exception as e:
-                st.error(f"Eroare salvare batch {i}: {e}")
+                st.warning(f"⚠️ Eroare batch {i//batch_size + 1}: {e}")
+                errors += 1
+                if errors > 5:
+                    st.error("Prea multe erori, opresc procesul")
+                    break
                 continue
         
         progress_bar.progress(1.0)
         status_container.empty()
         
-        log_event("step3_complete", f"PASUL 3 complet: {total_saved} mapări create", status="success")
+        # Verifică total final în DB
+        final_count = supabase.table("claude_sku_artcode_mapping").select("*", count="exact").execute()
+        total_in_db = final_count.count if final_count.count else 0
         
-        return total_saved
+        log_event("step3_complete", f"PASUL 3 complet: {total_saved} procesate, {total_in_db} total în DB", status="success")
+        
+        return total_in_db
         
     except Exception as e:
         st.error(f"❌ Eroare PASUL 3: {e}")
         log_event("step3_error", f"Eroare: {e}", status="error")
+        progress_bar.progress(0)
+        status_container.empty()
         return 0
+
 
 
 

@@ -656,16 +656,29 @@ def step3_map_sku_to_artcode():
         return 0
 
 
-# ============ PASUL 4: Verifică stoc și preț ============
+# ============ PASUL 4: Verifică stoc (EXCLUDE comenzi în tranzit) ============
 def step4_check_stock_and_prices():
-    """PASUL 4: Verifică stoc și prețuri în Foneday pentru produse cu stoc zero"""
+    """PASUL 4: Verifică stoc și prețuri - EXCLUDE produse cu comenzi pending"""
     
     progress_bar = st.progress(0)
     status_container = st.empty()
     
     log_event("step4_start", "PASUL 4: Verificare stoc și prețuri Foneday", status="info")
     
-    status_container.info("🔍 PASUL 4: Găsesc produse cu stoc zero...")
+    status_container.info("🔍 PASUL 4: Găsesc produse cu stoc zero (exclude comenzi în tranzit)...")
+    
+    # Citește SKU-urile cu comenzi pending
+    pending_orders = supabase.table("claude_foneday_orders_pending").select("sku, quantity").eq("status", "pending").execute()
+    
+    pending_skus = {}
+    if pending_orders.data:
+        for order in pending_orders.data:
+            sku = order["sku"]
+            qty = order["quantity"]
+            pending_skus[sku] = pending_skus.get(sku, 0) + qty
+    
+    if pending_skus:
+        st.info(f"📦 Găsite {len(pending_skus)} SKU-uri cu comenzi în tranzit (vor fi excluse)")
     
     zero_stock_result = supabase.table("claude_woo_stock").select("*").lte("stock_quantity", 0).execute()
     
@@ -676,9 +689,16 @@ def step4_check_stock_and_prices():
     zero_stock_products = zero_stock_result.data
     total_checked = 0
     total_available = 0
+    total_skipped_pending = 0
     
     for idx, product_data in enumerate(zero_stock_products):
         my_sku = product_data.get("sku")
+        
+        # SKIP dacă există comandă pending pentru acest SKU
+        if my_sku in pending_skus:
+            total_skipped_pending += 1
+            status_container.info(f"⏭️ SKIP {my_sku} - Comandă în tranzit: {pending_skus[my_sku]} buc")
+            continue
         
         status_container.info(f"🔍 PASUL 4: Verific {idx+1}/{len(zero_stock_products)}: {my_sku}")
         progress_bar.progress((idx + 1) / len(zero_stock_products))
@@ -722,7 +742,7 @@ def step4_check_stock_and_prices():
     progress_bar.progress(1.0)
     status_container.empty()
     
-    log_event("step4_complete", f"PASUL 4 complet: {total_checked} verificate, {total_available} disponibile", status="success")
+    log_event("step4_complete", f"PASUL 4: {total_checked} verificate, {total_available} disponibile, {total_skipped_pending} skip (pending)", status="success")
     
     return total_checked, total_available
 
@@ -906,7 +926,8 @@ page = st.sidebar.radio(
         "🔄 Import Individual (Pași)", 
         "💰 Oportunități Profit", 
         "📊 Stocuri Critice", 
-        "🛒 Coș Foneday", 
+        "🛒 Coș Foneday",
+        "🚚 Comenzi în Tranzit",
         "🗺️ Mapări", 
         "📝 Log"
     ]
@@ -926,7 +947,7 @@ if page == "🏠 Dashboard":
     
     st.markdown("### 📈 Statistici Generale")
     
-    col1, col2, col3, col4 = st.columns(4)
+    col1, col2, col3, col4, col5 = st.columns(5)
     
     with col1:
         try:
@@ -955,6 +976,13 @@ if page == "🏠 Dashboard":
             st.metric("🗺️ Mapări SKU", mapping_count.count if mapping_count.count else 0)
         except:
             st.metric("🗺️ Mapări SKU", "N/A")
+    
+    with col5:
+        try:
+            pending_count = supabase.table("claude_foneday_orders_pending").select("*", count="exact").eq("status", "pending").execute()
+            st.metric("🚚 În Tranzit", pending_count.count if pending_count.count else 0)
+        except:
+            st.metric("🚚 În Tranzit", "N/A")
     
     st.markdown("---")
     
@@ -1031,6 +1059,7 @@ elif page == "🔄 Import Individual (Pași)":
         
         **Ce face:**
         - Găsește produsele tale cu stoc zero
+        - **EXCLUDE produse cu comenzi în tranzit** (evită dublare comenzi)
         - Pentru fiecare: găsește maparea → verifică prin API Foneday (timp real)
         - **Dacă e disponibil** → salvează în `claude_foneday_inventory`
         
@@ -1066,8 +1095,9 @@ elif page == "🔄 Import Individual (Pași)":
         
         **Zilnic (reaprovizionare):**
         1. Pasul 1 → Actualizează stocuri/prețuri
-        2. Pasul 4 → Verifică stoc zero
+        2. Pasul 4 → Verifică stoc zero (exclude comenzi în tranzit)
         3. Pasul 5 → Adaugă în coș
+        4. Mergi la "🚚 Comenzi în Tranzit" → Confirmă comenzile
         
         **Săptămânal (optimizare):**
         - 💰 Oportunități Profit (marjă mare)
@@ -1452,6 +1482,153 @@ elif page == "🛒 Coș Foneday":
         st.error(f"Eroare: {e}")
 
 
+elif page == "🚚 Comenzi în Tranzit":
+    st.title("🚚 Comenzi în Tranzit (Pending)")
+    
+    st.markdown("""
+    ### Gestionează comenzi plasate la Foneday care sunt în livrare
+    
+    📦 **Comenzile confirmate** sunt excluse automat din Pașii 4-5 pentru a evita comenzi duplicate.
+    
+    **Flow:**
+    1. Plasezi comanda la Foneday
+    2. Confirmi comanda aici → status **pending**
+    3. La livrare → marchezi ca **delivered** sau **ștergi**
+    """)
+    
+    st.markdown("---")
+    
+    tab1, tab2, tab3 = st.tabs(["🛒 Coș de Confirmat", "🚚 În Tranzit", "📦 Istoric"])
+    
+    with tab1:
+        st.markdown("## 🛒 Produse din Coș - De Confirmat")
+        
+        cart = supabase.table("claude_foneday_cart").select("*").eq("status", "added_to_cart").order("created_at", desc=True).execute()
+        
+        if cart.data and len(cart.data) > 0:
+            st.info(f"📊 Găsite {len(cart.data)} produse în coș de confirmat")
+            
+            for idx, item in enumerate(cart.data):
+                col1, col2, col3, col4 = st.columns([3, 1, 1, 2])
+                
+                with col1:
+                    st.text(f"{item['sku']} - {item['quantity']} buc - €{item['price_eur']:.2f}")
+                
+                with col2:
+                    st.text(f"{item['profit_margin']:.1f}%")
+                
+                with col3:
+                    expected_delivery = st.date_input(
+                        "Livrare",
+                        value=datetime.now() + timedelta(days=4),
+                        key=f"delivery_{idx}",
+                        label_visibility="collapsed"
+                    )
+                
+                with col4:
+                    if st.button("✅ Confirmă Comandă", key=f"confirm_{idx}", use_container_width=True):
+                        try:
+                            supabase.table("claude_foneday_orders_pending").insert({
+                                "sku": item["sku"],
+                                "foneday_sku": item["foneday_sku"],
+                                "quantity": item["quantity"],
+                                "order_date": item["created_at"],
+                                "expected_delivery_date": expected_delivery.isoformat(),
+                                "confirmed_at": datetime.now().isoformat(),
+                                "confirmed_by": "manual",
+                                "status": "pending",
+                                "note": item.get("note", "")
+                            }).execute()
+                            
+                            supabase.table("claude_foneday_cart").update({
+                                "status": "confirmed"
+                            }).eq("id", item["id"]).execute()
+                            
+                            st.success(f"✅ Comanda confirmată: {item['sku']} × {item['quantity']}")
+                            time.sleep(1)
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Eroare: {e}")
+        else:
+            st.info("Coșul e gol - nu există comenzi de confirmat")
+    
+    with tab2:
+        st.markdown("## 🚚 Comenzi în Livrare")
+        
+        pending = supabase.table("claude_foneday_orders_pending").select("*").eq("status", "pending").order("expected_delivery_date").execute()
+        
+        if pending.data and len(pending.data) > 0:
+            st.info(f"📦 Găsite {len(pending.data)} comenzi în tranzit")
+            
+            for idx, order in enumerate(pending.data):
+                col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 1, 2])
+                
+                with col1:
+                    st.text(f"{order['sku']} × {order['quantity']}")
+                
+                with col2:
+                    order_date = datetime.fromisoformat(order['order_date']).strftime('%Y-%m-%d')
+                    st.text(f"📅 {order_date}")
+                
+                with col3:
+                    if order['expected_delivery_date']:
+                        st.text(f"🚚 {order['expected_delivery_date']}")
+                    else:
+                        st.text("🚚 N/A")
+                
+                with col4:
+                    days_ago = (datetime.now() - datetime.fromisoformat(order['order_date'])).days
+                    st.text(f"{days_ago}d")
+                
+                with col5:
+                    col_delivered, col_cancel = st.columns(2)
+                    
+                    with col_delivered:
+                        if st.button("✅ Livrat", key=f"deliver_{idx}", use_container_width=True):
+                            try:
+                                supabase.table("claude_foneday_orders_pending").update({
+                                    "status": "delivered",
+                                    "updated_at": datetime.now().isoformat()
+                                }).eq("id", order["id"]).execute()
+                                
+                                st.success(f"✅ Marcat ca livrat: {order['sku']}")
+                                time.sleep(1)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Eroare: {e}")
+                    
+                    with col_cancel:
+                        if st.button("❌ Anulează", key=f"cancel_{idx}", use_container_width=True):
+                            try:
+                                supabase.table("claude_foneday_orders_pending").update({
+                                    "status": "cancelled",
+                                    "updated_at": datetime.now().isoformat()
+                                }).eq("id", order["id"]).execute()
+                                
+                                st.warning(f"❌ Comandă anulată: {order['sku']}")
+                                time.sleep(1)
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Eroare: {e}")
+        else:
+            st.success("✅ Nu există comenzi în tranzit")
+    
+    with tab3:
+        st.markdown("## 📦 Istoric Comenzi")
+        
+        history = supabase.table("claude_foneday_orders_pending").select("*").in_("status", ["delivered", "cancelled"]).order("updated_at", desc=True).limit(50).execute()
+        
+        if history.data:
+            df = pd.DataFrame(history.data)
+            st.dataframe(
+                df[["sku", "quantity", "order_date", "status", "expected_delivery_date", "updated_at"]],
+                use_container_width=True,
+                height=400
+            )
+        else:
+            st.info("Nu există istoric")
+
+
 elif page == "🗺️ Mapări":
     st.title("🗺️ Mapări SKU → artcode")
     
@@ -1495,5 +1672,5 @@ elif page == "📝 Log":
 
 
 st.sidebar.markdown("---")
-st.sidebar.caption("📦 ServicePack v3.5")
-st.sidebar.caption("Mapare optimizată + Oportunități exclude stoc 0")
+st.sidebar.caption("📦 ServicePack v4.0")
+st.sidebar.caption("Tracking comenzi în tranzit")

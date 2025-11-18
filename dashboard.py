@@ -667,7 +667,6 @@ def step4_check_stock_and_prices():
     
     status_container.info("🔍 PASUL 4: Găsesc produse cu stoc zero (exclude comenzi în tranzit)...")
     
-    # Citește SKU-urile cu comenzi pending
     pending_orders = supabase.table("claude_foneday_orders_pending").select("sku, quantity").eq("status", "pending").execute()
     
     pending_skus = {}
@@ -694,7 +693,6 @@ def step4_check_stock_and_prices():
     for idx, product_data in enumerate(zero_stock_products):
         my_sku = product_data.get("sku")
         
-        # SKIP dacă există comandă pending pentru acest SKU
         if my_sku in pending_skus:
             total_skipped_pending += 1
             status_container.info(f"⏭️ SKIP {my_sku} - Comandă în tranzit: {pending_skus[my_sku]} buc")
@@ -1498,6 +1496,28 @@ elif page == "🚚 Comenzi în Tranzit":
     
     st.markdown("---")
     
+    # BUTON NOU - Golire comenzi
+    col1, col2, col3 = st.columns([1, 1, 1])
+    with col2:
+        if st.button("🗑️ GOLEȘTE TOATE COMENZILE", type="secondary", use_container_width=True):
+            if st.session_state.get('confirm_clear_orders'):
+                try:
+                    # Șterge din coș
+                    supabase.table("claude_foneday_cart").delete().eq("status", "added_to_cart").execute()
+                    # Șterge din pending
+                    supabase.table("claude_foneday_orders_pending").delete().eq("status", "pending").execute()
+                    st.success("✅ Toate comenzile au fost șterse!")
+                    st.session_state['confirm_clear_orders'] = False
+                    time.sleep(1)
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Eroare: {e}")
+            else:
+                st.session_state['confirm_clear_orders'] = True
+                st.warning("⚠️ Apasă din nou pentru a confirma ștergerea!")
+    
+    st.markdown("---")
+    
     tab1, tab2, tab3 = st.tabs(["🛒 Coș de Confirmat", "🚚 În Tranzit", "📦 Istoric"])
     
     with tab1:
@@ -1567,18 +1587,48 @@ elif page == "🚚 Comenzi în Tranzit":
                     st.text(f"{order['sku']} × {order['quantity']}")
                 
                 with col2:
-                    order_date = datetime.fromisoformat(order['order_date']).strftime('%Y-%m-%d')
-                    st.text(f"📅 {order_date}")
+                    # FIX: Handle date parsing safely
+                    try:
+                        if order.get('order_date'):
+                            if isinstance(order['order_date'], str):
+                                order_dt = datetime.fromisoformat(order['order_date'].replace('Z', '+00:00'))
+                            else:
+                                order_dt = order['order_date']
+                            order_date_str = order_dt.strftime('%Y-%m-%d')
+                        else:
+                            order_date_str = "N/A"
+                    except Exception:
+                        order_date_str = "N/A"
+                    
+                    st.text(f"📅 {order_date_str}")
                 
                 with col3:
-                    if order['expected_delivery_date']:
+                    if order.get('expected_delivery_date'):
                         st.text(f"🚚 {order['expected_delivery_date']}")
                     else:
                         st.text("🚚 N/A")
                 
                 with col4:
-                    days_ago = (datetime.now() - datetime.fromisoformat(order['order_date'])).days
-                    st.text(f"{days_ago}d")
+                    # FIX: Calculate days_ago safely
+                    try:
+                        if order.get('order_date'):
+                            if isinstance(order['order_date'], str):
+                                order_dt = datetime.fromisoformat(order['order_date'].replace('Z', '+00:00'))
+                            else:
+                                order_dt = order['order_date']
+                            
+                            # Make both timezone-aware or both naive
+                            if order_dt.tzinfo is not None:
+                                now_dt = datetime.now(order_dt.tzinfo)
+                            else:
+                                now_dt = datetime.now()
+                            
+                            days_ago = (now_dt - order_dt).days
+                            st.text(f"{days_ago}d")
+                        else:
+                            st.text("N/A")
+                    except Exception as e:
+                        st.text("N/A")
                 
                 with col5:
                     col_delivered, col_cancel = st.columns(2)
@@ -1672,5 +1722,5 @@ elif page == "📝 Log":
 
 
 st.sidebar.markdown("---")
-st.sidebar.caption("📦 ServicePack v4.0")
-st.sidebar.caption("Tracking comenzi în tranzit")
+st.sidebar.caption("📦 ServicePack v4.1")
+st.sidebar.caption("Fix eroare date + Golire comenzi")

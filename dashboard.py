@@ -177,150 +177,266 @@ def get_all_skus_for_sku(sku: str):
         return [{"sku": sku, "is_primary": True}]
 
 
-# ============ PASUL 1: Import WooCommerce (OPTIMIZAT - FĂRĂ TIMEOUT) ============
+# ============ PASUL 1: HIBRID - Cel mai bun din ambele ============
 def step1_import_woocommerce():
-    """PASUL 1: Import produse, prețuri și stocuri din WooCommerce - UPSERT batch optimizat"""
+    """PASUL 1: Import WooCommerce - HIBRID (citire simplă + salvare incrementală)"""
+    
     page = 1
     per_page = 100
-    total_products = 0
+    total_simple = 0
+    total_variations = 0
     total_errors = 0
+    max_pages = 100
     
     progress_bar = st.progress(0)
     status_container = st.empty()
     
-    log_event("step1_start", "PASUL 1: Începe import WooCommerce", status="info")
-    status_container.info("📥 PASUL 1: Citesc produse din WooCommerce...")
+    log_event("step1_start", "PASUL 1: Start sincronizare WooCommerce", status="info")
     
-    all_stock_data = []
-    all_price_data = []
+    # FAZA 1: Produse simple/externe/grouped
+    status_container.info("📥 FAZA 1: Citesc produse simple...")
     
-    # Citește TOATE paginile din WooCommerce
-    while True:
+    while page <= max_pages:
         try:
-            status_container.info(f"📥 Citesc pagina {page} din WooCommerce...")
+            status_container.info(f"📥 Citesc pagina {page} (simple)...")
             
-            response = wcapi.get("products", params={"per_page": per_page, "page": page})
+            # Requests direct (mai rapid decât wcapi)
+            response = requests.get(
+                f"{WOO_URL}/wp-json/wc/v3/products",
+                auth=(WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET),
+                params={
+                    "per_page": per_page, 
+                    "page": page,
+                    "status": "publish"
+                },
+                timeout=30
+            )
             
             if response.status_code != 200:
-                error_msg = f"Eroare API WooCommerce pagina {page}: {response.status_code}"
-                st.error(f"❌ {error_msg}")
-                log_event("step1_error", error_msg, status="error")
+                log_event("step1_error", f"Eroare API pagina {page}: {response.status_code}", status="error")
                 break
             
             products = response.json()
             
-            if not products:
+            if not products or len(products) == 0:
                 break
             
-            for product in products:
-                try:
-                    sku = product.get("sku")
-                    if not sku:
-                        continue
-                    
-                    product_info = get_product_info_from_catalog(sku)
-                    product_id = product_info["product_id"] if product_info else None
-                    
-                    stock_quantity = product.get("stock_quantity", 0)
-                    regular_price = product.get("regular_price", "0")
-                    woo_product_id = product.get("id")
-                    
-                    current_stock = stock_quantity if stock_quantity is not None else 0
-                    current_price = float(regular_price) if regular_price else 0
-                    
-                    # Adaugă în batch
-                    stock_data = {
-                        "sku": sku,
-                        "stock_quantity": current_stock,
-                        "woo_product_id": woo_product_id,
-                        "last_sync_at": datetime.now().isoformat()
-                    }
-                    if product_id:
-                        stock_data["product_id"] = product_id
-                    
-                    all_stock_data.append(stock_data)
-                    
-                    price_data = {
-                        "sku": sku,
-                        "regular_price": current_price,
-                        "woo_product_id": woo_product_id,
-                        "last_sync_at": datetime.now().isoformat()
-                    }
-                    if product_id:
-                        price_data["product_id"] = product_id
-                    
-                    all_price_data.append(price_data)
-                    total_products += 1
-                    
-                except Exception as e:
-                    total_errors += 1
-                    log_event("step1_error", f"Eroare procesare produs: {e}", status="error")
-                    continue
+            # Filtrează doar simple, external, grouped (NU variable)
+            simple_products = [p for p in products if p.get('type') in ['simple', 'external', 'grouped']]
             
-            progress_bar.progress(min(page / 30, 0.95))
+            # Procesează și salvează IMEDIAT
+            if simple_products:
+                batch_stock = []
+                batch_price = []
+                
+                for product in simple_products:
+                    try:
+                        sku = product.get("sku", "").strip()
+                        if not sku:
+                            continue
+                        
+                        product_info = get_product_info_from_catalog(sku)
+                        product_id = product_info["product_id"] if product_info else None
+                        
+                        stock_quantity = product.get("stock_quantity", 0)
+                        regular_price = product.get("regular_price", "0")
+                        woo_product_id = product.get("id")
+                        
+                        current_stock = stock_quantity if stock_quantity is not None else 0
+                        current_price = float(regular_price) if regular_price else 0
+                        
+                        stock_data = {
+                            "sku": sku,
+                            "stock_quantity": current_stock,
+                            "woo_product_id": woo_product_id,
+                            "last_sync_at": datetime.now().isoformat()
+                        }
+                        if product_id:
+                            stock_data["product_id"] = product_id
+                        
+                        batch_stock.append(stock_data)
+                        
+                        price_data = {
+                            "sku": sku,
+                            "regular_price": current_price,
+                            "woo_product_id": woo_product_id,
+                            "last_sync_at": datetime.now().isoformat()
+                        }
+                        if product_id:
+                            price_data["product_id"] = product_id
+                        
+                        batch_price.append(price_data)
+                        
+                    except Exception as e:
+                        total_errors += 1
+                        continue
+                
+                # UPSERT imediat
+                if batch_stock:
+                    try:
+                        status_container.warning(f"💾 Salvez {len(batch_stock)} produse simple...")
+                        
+                        supabase.table("claude_woo_stock").upsert(batch_stock, on_conflict="sku").execute()
+                        supabase.table("claude_woo_prices").upsert(batch_price, on_conflict="sku").execute()
+                        
+                        total_simple += len(batch_stock)
+                        log_event("step1_process", f"Pagina {page}: {len(batch_stock)} simple. Total: {total_simple}", status="info")
+                        
+                    except Exception as e:
+                        log_event("step1_error", f"Eroare salvare pagina {page}: {e}", status="error")
+                        total_errors += 1
+            
+            progress_bar.progress(min(0.5 * (page / max_pages), 0.49))
             page += 1
-            time.sleep(0.2)
+            time.sleep(0.3)
             
         except Exception as e:
-            error_msg = f"Eroare critică pagina {page}: {e}"
-            st.error(f"❌ {error_msg}")
-            log_event("step1_error", error_msg, status="error")
+            log_event("step1_error", f"Eroare critică pagina {page}: {e}", status="error")
             break
     
-    # UPSERT în batch-uri de 500 (eficient, fără timeout)
-    status_container.info(f"💾 Salvez {total_products} produse în database...")
-    log_event("step1_process", f"Procesez {total_products} produse citite din WooCommerce", status="info")
-    
-    saved_stock = 0
-    saved_prices = 0
-    batch_size = 500
+    # FAZA 2: Variații (dacă ai produse variabile)
+    status_container.info("🔄 FAZA 2: Citesc produse variabile...")
     
     try:
-        # UPSERT stocuri în batch-uri
-        for i in range(0, len(all_stock_data), batch_size):
-            batch = all_stock_data[i:i+batch_size]
-            try:
-                supabase.table("claude_woo_stock").upsert(
-                    batch,
-                    on_conflict="sku"
-                ).execute()
-                saved_stock += len(batch)
-                status_container.info(f"💾 Salvat stoc: {saved_stock}/{len(all_stock_data)}")
-            except Exception as e:
-                log_event("step1_error", f"Eroare upsert stoc batch {i}: {e}", status="error")
+        # Găsește toate produsele variabile
+        page_var = 1
+        variable_products = []
         
-        # UPSERT prețuri în batch-uri
-        for i in range(0, len(all_price_data), batch_size):
-            batch = all_price_data[i:i+batch_size]
-            try:
-                supabase.table("claude_woo_prices").upsert(
-                    batch,
-                    on_conflict="sku"
-                ).execute()
-                saved_prices += len(batch)
-                status_container.info(f"💾 Salvat prețuri: {saved_prices}/{len(all_price_data)}")
-            except Exception as e:
-                log_event("step1_error", f"Eroare upsert prețuri batch {i}: {e}", status="error")
+        while page_var <= 20:  # Max 20 pagini de variabile
+            response = requests.get(
+                f"{WOO_URL}/wp-json/wc/v3/products",
+                auth=(WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET),
+                params={
+                    "per_page": 100,
+                    "page": page_var,
+                    "type": "variable",
+                    "status": "publish"
+                },
+                timeout=30
+            )
+            
+            if response.status_code != 200:
+                break
+            
+            vars = response.json()
+            if not vars:
+                break
+            
+            variable_products.extend(vars)
+            page_var += 1
+            time.sleep(0.2)
+        
+        if variable_products:
+            status_container.info(f"🔄 Procesez {len(variable_products)} produse variabile...")
+            log_event("step1_process", f"Găsite {len(variable_products)} produse variabile", status="info")
+            
+            for idx, vp in enumerate(variable_products, 1):
+                vpage = 1
+                
+                while vpage <= 10:  # Max 10 pagini de variații per produs
+                    try:
+                        vr = requests.get(
+                            f"{WOO_URL}/wp-json/wc/v3/products/{vp['id']}/variations",
+                            auth=(WOO_CONSUMER_KEY, WOO_CONSUMER_SECRET),
+                            params={"per_page": 100, "page": vpage},
+                            timeout=30
+                        )
+                        
+                        if vr.status_code != 200:
+                            break
+                        
+                        variations = vr.json()
+                        if not variations:
+                            break
+                        
+                        # Procesează variațiile
+                        batch_stock = []
+                        batch_price = []
+                        
+                        for var in variations:
+                            try:
+                                sku = var.get("sku", "").strip()
+                                if not sku:
+                                    continue
+                                
+                                product_info = get_product_info_from_catalog(sku)
+                                product_id = product_info["product_id"] if product_info else None
+                                
+                                stock_quantity = var.get("stock_quantity", 0)
+                                regular_price = var.get("regular_price", "0")
+                                woo_product_id = var.get("id")
+                                
+                                current_stock = stock_quantity if stock_quantity is not None else 0
+                                current_price = float(regular_price) if regular_price else 0
+                                
+                                stock_data = {
+                                    "sku": sku,
+                                    "stock_quantity": current_stock,
+                                    "woo_product_id": woo_product_id,
+                                    "last_sync_at": datetime.now().isoformat()
+                                }
+                                if product_id:
+                                    stock_data["product_id"] = product_id
+                                
+                                batch_stock.append(stock_data)
+                                
+                                price_data = {
+                                    "sku": sku,
+                                    "regular_price": current_price,
+                                    "woo_product_id": woo_product_id,
+                                    "last_sync_at": datetime.now().isoformat()
+                                }
+                                if product_id:
+                                    price_data["product_id"] = product_id
+                                
+                                batch_price.append(price_data)
+                                
+                            except Exception as e:
+                                total_errors += 1
+                                continue
+                        
+                        # UPSERT variațiile
+                        if batch_stock:
+                            try:
+                                supabase.table("claude_woo_stock").upsert(batch_stock, on_conflict="sku").execute()
+                                supabase.table("claude_woo_prices").upsert(batch_price, on_conflict="sku").execute()
+                                
+                                total_variations += len(batch_stock)
+                                
+                            except Exception as e:
+                                log_event("step1_error", f"Eroare salvare variații: {e}", status="error")
+                                total_errors += 1
+                        
+                        vpage += 1
+                        time.sleep(0.1)
+                        
+                    except Exception as e:
+                        log_event("step1_error", f"Eroare variații produs {vp['id']}: {e}", status="error")
+                        break
+                
+                if idx % 10 == 0:
+                    status_container.info(f"🔄 {idx}/{len(variable_products)} variabile procesate ({total_variations} variații)")
+                    progress_bar.progress(0.5 + (0.5 * (idx / len(variable_products))))
         
     except Exception as e:
-        error_msg = f"Eroare salvare batch: {e}"
-        st.error(f"❌ {error_msg}")
-        log_event("step1_error", error_msg, status="error")
+        log_event("step1_error", f"Eroare procesare variabile: {e}", status="error")
     
     progress_bar.progress(1.0)
     status_container.empty()
     
-    success_msg = f"PASUL 1 complet: {saved_stock} stocuri salvate, {saved_prices} prețuri salvate, {total_errors} erori"
+    total_products = total_simple + total_variations
+    success_msg = f"PASUL 1 complet: {total_products} produse ({total_simple} simple + {total_variations} variații), {total_errors} erori"
     log_event("step1_complete", success_msg, status="success")
     
     st.success(f"""
     ✅ **PASUL 1 FINALIZAT:**
-    - 📦 {saved_stock} produse sincronizate (stoc)
-    - 💰 {saved_prices} produse sincronizate (prețuri)
+    - 📦 {total_simple} produse simple sincronizate
+    - 🔄 {total_variations} variații sincronizate
+    - 📊 **Total: {total_products} produse**
     - ❌ {total_errors} erori
     """)
     
-    return total_products, saved_stock, saved_prices, total_errors
+    return total_products, total_simple, total_variations, total_errors
 
 
 # ============ PASUL 2: Import + Normalizare artcode ============

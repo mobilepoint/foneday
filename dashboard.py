@@ -177,37 +177,30 @@ def get_all_skus_for_sku(sku: str):
         return [{"sku": sku, "is_primary": True}]
 
 
-# ============ PASUL 1: Import WooCommerce ============
+# ============ PASUL 1: Import WooCommerce (FORȚEAZĂ UPDATE TOTAL) ============
 def step1_import_woocommerce():
-    """PASUL 1: Import produse, prețuri și stocuri din WooCommerce"""
+    """PASUL 1: Import produse, prețuri și stocuri din WooCommerce - FORȚEAZĂ UPDATE"""
     page = 1
     per_page = 100
     total_new = 0
     total_updated = 0
-    total_unchanged = 0
     total_errors = 0
     
     progress_bar = st.progress(0)
     status_container = st.empty()
     
-    log_event("step1_start", "PASUL 1: Începe import WooCommerce", status="info")
+    log_event("step1_start", "PASUL 1: Începe import WooCommerce (sincronizare completă)", status="info")
     
-    existing_products = {}
-    existing_prices = {}
+    # Citește produsele existente pentru a ști care sunt noi
+    existing_skus = set()
     
     try:
-        status_container.info("📂 Citesc datele existente...")
-        existing_result = supabase.table("claude_woo_stock").select("sku, stock_quantity").execute()
+        status_container.info("📂 Citesc SKU-urile existente...")
+        existing_result = supabase.table("claude_woo_stock").select("sku").execute()
         if existing_result.data:
-            for item in existing_result.data:
-                existing_products[item["sku"]] = item.get("stock_quantity", 0)
+            existing_skus = {item["sku"] for item in existing_result.data}
         
-        existing_price_result = supabase.table("claude_woo_prices").select("sku, regular_price").execute()
-        if existing_price_result.data:
-            for item in existing_price_result.data:
-                existing_prices[item["sku"]] = float(item.get("regular_price", 0))
-        
-        status_container.success(f"✅ Găsite {len(existing_products)} produse existente")
+        status_container.success(f"✅ Găsite {len(existing_skus)} produse existente")
         time.sleep(1)
     except Exception as e:
         log_event("step1_error", f"Eroare la citirea datelor: {e}", status="error")
@@ -248,11 +241,10 @@ def step1_import_woocommerce():
                     current_stock = stock_quantity if stock_quantity is not None else 0
                     current_price = float(regular_price) if regular_price else 0
                     
-                    is_new = sku not in existing_products
-                    stock_changed = not is_new and existing_products[sku] != current_stock
-                    price_changed = sku in existing_prices and existing_prices[sku] != current_price
+                    is_new = sku not in existing_skus
                     
                     if is_new:
+                        # Produs NOU - INSERT
                         stock_data = {
                             "sku": sku,
                             "stock_quantity": current_stock,
@@ -274,109 +266,125 @@ def step1_import_woocommerce():
                         batch_new_price.append(price_data)
                         
                         total_new += 1
+                    else:
+                        # Produs EXISTENT - FORȚEAZĂ UPDATE (chiar dacă nu s-a schimbat nimic)
+                        batch_update_stock.append({
+                            "sku": sku,
+                            "stock_quantity": current_stock,
+                            "woo_product_id": woo_product_id,
+                            "last_sync_at": datetime.now().isoformat()
+                        })
                         
-                    elif stock_changed or price_changed:
-                        if stock_changed:
-                            batch_update_stock.append({
-                                "sku": sku,
-                                "stock_quantity": current_stock,
-                                "last_sync_at": datetime.now().isoformat()
-                            })
-                        
-                        if price_changed:
-                            batch_update_price.append({
-                                "sku": sku,
-                                "regular_price": current_price,
-                                "last_sync_at": datetime.now().isoformat()
-                            })
+                        batch_update_price.append({
+                            "sku": sku,
+                            "regular_price": current_price,
+                            "woo_product_id": woo_product_id,
+                            "last_sync_at": datetime.now().isoformat()
+                        })
                         
                         total_updated += 1
-                    else:
-                        total_unchanged += 1
                     
                 except Exception as e:
                     total_errors += 1
                     continue
             
+            # Salvează la fiecare 5 pagini
             if page % 5 == 0:
-                status_container.warning(f"💾 Salvez...")
+                status_container.warning(f"💾 Salvez batch {page}...")
                 
+                # INSERT produse noi
                 if batch_new_stock:
                     try:
                         supabase.table("claude_woo_stock").insert(batch_new_stock).execute()
                         batch_new_stock = []
-                    except: pass
+                    except Exception as e:
+                        st.warning(f"Eroare insert stock: {e}")
                 
                 if batch_new_price:
                     try:
                         supabase.table("claude_woo_prices").insert(batch_new_price).execute()
                         batch_new_price = []
-                    except: pass
+                    except Exception as e:
+                        st.warning(f"Eroare insert prices: {e}")
                 
+                # UPDATE produse existente (TOATE)
                 if batch_update_stock:
-                    for item in batch_update_stock:
-                        try:
+                    try:
+                        for item in batch_update_stock:
                             supabase.table("claude_woo_stock").update({
                                 "stock_quantity": item["stock_quantity"],
+                                "woo_product_id": item["woo_product_id"],
                                 "last_sync_at": item["last_sync_at"]
                             }).eq("sku", item["sku"]).execute()
-                        except: pass
-                    batch_update_stock = []
+                        batch_update_stock = []
+                    except Exception as e:
+                        st.warning(f"Eroare update stock: {e}")
                 
                 if batch_update_price:
-                    for item in batch_update_price:
-                        try:
+                    try:
+                        for item in batch_update_price:
                             supabase.table("claude_woo_prices").update({
                                 "regular_price": item["regular_price"],
+                                "woo_product_id": item["woo_product_id"],
                                 "last_sync_at": item["last_sync_at"]
                             }).eq("sku", item["sku"]).execute()
-                        except: pass
-                    batch_update_price = []
+                        batch_update_price = []
+                    except Exception as e:
+                        st.warning(f"Eroare update prices: {e}")
             
             progress_bar.progress(min(page / 30, 0.99))
             page += 1
             time.sleep(0.3)
             
         except Exception as e:
-            st.error(f"❌ Eroare: {e}")
+            st.error(f"❌ Eroare pagină {page}: {e}")
             break
     
+    # Salvează ultimul batch
     status_container.warning(f"💾 Finalizare PASUL 1...")
     
     if batch_new_stock:
         try:
             supabase.table("claude_woo_stock").insert(batch_new_stock).execute()
-        except: pass
+        except Exception as e:
+            st.warning(f"Eroare insert final stock: {e}")
     
     if batch_new_price:
         try:
             supabase.table("claude_woo_prices").insert(batch_new_price).execute()
-        except: pass
+        except Exception as e:
+            st.warning(f"Eroare insert final prices: {e}")
     
     if batch_update_stock:
-        for item in batch_update_stock:
-            try:
+        try:
+            for item in batch_update_stock:
                 supabase.table("claude_woo_stock").update({
                     "stock_quantity": item["stock_quantity"],
+                    "woo_product_id": item["woo_product_id"],
                     "last_sync_at": item["last_sync_at"]
                 }).eq("sku", item["sku"]).execute()
-            except: pass
+        except Exception as e:
+            st.warning(f"Eroare update final stock: {e}")
     
     if batch_update_price:
-        for item in batch_update_price:
-            try:
+        try:
+            for item in batch_update_price:
                 supabase.table("claude_woo_prices").update({
                     "regular_price": item["regular_price"],
+                    "woo_product_id": item["woo_product_id"],
                     "last_sync_at": item["last_sync_at"]
                 }).eq("sku", item["sku"]).execute()
-            except: pass
+        except Exception as e:
+            st.warning(f"Eroare update final prices: {e}")
     
     progress_bar.progress(1.0)
     status_container.empty()
     
-    log_event("step1_complete", f"PASUL 1 complet: {total_new} noi, {total_updated} actualizate", status="success")
+    log_event("step1_complete", f"PASUL 1 complet: {total_new} noi, {total_updated} actualizate (forțat), {total_errors} erori", status="success")
     
-    return total_new, total_updated, total_unchanged, total_errors
+    st.success(f"✅ **PASUL 1 finalizat:**\n- 🆕 {total_new} produse noi\n- 🔄 {total_updated} produse actualizate\n- ❌ {total_errors} erori")
+    
+    return total_new, total_updated, 0, total_errors
 
 
 # ============ PASUL 2: Import + Normalizare artcode ============

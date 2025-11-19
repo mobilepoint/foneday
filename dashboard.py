@@ -177,47 +177,34 @@ def get_all_skus_for_sku(sku: str):
         return [{"sku": sku, "is_primary": True}]
 
 
-# ============ PASUL 1: Import WooCommerce (FORȚEAZĂ UPDATE TOTAL) ============
+# ============ PASUL 1: Import WooCommerce (OPTIMIZAT - FĂRĂ TIMEOUT) ============
 def step1_import_woocommerce():
-    """PASUL 1: Import produse, prețuri și stocuri din WooCommerce - FORȚEAZĂ UPDATE"""
+    """PASUL 1: Import produse, prețuri și stocuri din WooCommerce - UPSERT batch optimizat"""
     page = 1
     per_page = 100
-    total_new = 0
-    total_updated = 0
+    total_products = 0
     total_errors = 0
     
     progress_bar = st.progress(0)
     status_container = st.empty()
     
-    log_event("step1_start", "PASUL 1: Începe import WooCommerce (sincronizare completă)", status="info")
+    log_event("step1_start", "PASUL 1: Începe import WooCommerce", status="info")
+    status_container.info("📥 PASUL 1: Citesc produse din WooCommerce...")
     
-    # Citește produsele existente pentru a ști care sunt noi
-    existing_skus = set()
+    all_stock_data = []
+    all_price_data = []
     
-    try:
-        status_container.info("📂 Citesc SKU-urile existente...")
-        existing_result = supabase.table("claude_woo_stock").select("sku").execute()
-        if existing_result.data:
-            existing_skus = {item["sku"] for item in existing_result.data}
-        
-        status_container.success(f"✅ Găsite {len(existing_skus)} produse existente")
-        time.sleep(1)
-    except Exception as e:
-        log_event("step1_error", f"Eroare la citirea datelor: {e}", status="error")
-    
-    batch_new_stock = []
-    batch_new_price = []
-    batch_update_stock = []
-    batch_update_price = []
-    
+    # Citește TOATE paginile din WooCommerce
     while True:
         try:
-            status_container.info(f"📥 PASUL 1: Citesc WooCommerce - pagina {page}...")
+            status_container.info(f"📥 Citesc pagina {page} din WooCommerce...")
             
             response = wcapi.get("products", params={"per_page": per_page, "page": page})
             
             if response.status_code != 200:
-                st.error(f"❌ Eroare API WooCommerce: {response.status_code}")
+                error_msg = f"Eroare API WooCommerce pagina {page}: {response.status_code}"
+                st.error(f"❌ {error_msg}")
+                log_event("step1_error", error_msg, status="error")
                 break
             
             products = response.json()
@@ -241,150 +228,99 @@ def step1_import_woocommerce():
                     current_stock = stock_quantity if stock_quantity is not None else 0
                     current_price = float(regular_price) if regular_price else 0
                     
-                    is_new = sku not in existing_skus
+                    # Adaugă în batch
+                    stock_data = {
+                        "sku": sku,
+                        "stock_quantity": current_stock,
+                        "woo_product_id": woo_product_id,
+                        "last_sync_at": datetime.now().isoformat()
+                    }
+                    if product_id:
+                        stock_data["product_id"] = product_id
                     
-                    if is_new:
-                        # Produs NOU - INSERT
-                        stock_data = {
-                            "sku": sku,
-                            "stock_quantity": current_stock,
-                            "woo_product_id": woo_product_id,
-                            "last_sync_at": datetime.now().isoformat()
-                        }
-                        if product_id:
-                            stock_data["product_id"] = product_id
-                        batch_new_stock.append(stock_data)
-                        
-                        price_data = {
-                            "sku": sku,
-                            "regular_price": current_price,
-                            "woo_product_id": woo_product_id,
-                            "last_sync_at": datetime.now().isoformat()
-                        }
-                        if product_id:
-                            price_data["product_id"] = product_id
-                        batch_new_price.append(price_data)
-                        
-                        total_new += 1
-                    else:
-                        # Produs EXISTENT - FORȚEAZĂ UPDATE (chiar dacă nu s-a schimbat nimic)
-                        batch_update_stock.append({
-                            "sku": sku,
-                            "stock_quantity": current_stock,
-                            "woo_product_id": woo_product_id,
-                            "last_sync_at": datetime.now().isoformat()
-                        })
-                        
-                        batch_update_price.append({
-                            "sku": sku,
-                            "regular_price": current_price,
-                            "woo_product_id": woo_product_id,
-                            "last_sync_at": datetime.now().isoformat()
-                        })
-                        
-                        total_updated += 1
+                    all_stock_data.append(stock_data)
+                    
+                    price_data = {
+                        "sku": sku,
+                        "regular_price": current_price,
+                        "woo_product_id": woo_product_id,
+                        "last_sync_at": datetime.now().isoformat()
+                    }
+                    if product_id:
+                        price_data["product_id"] = product_id
+                    
+                    all_price_data.append(price_data)
+                    total_products += 1
                     
                 except Exception as e:
                     total_errors += 1
+                    log_event("step1_error", f"Eroare procesare produs: {e}", status="error")
                     continue
             
-            # Salvează la fiecare 5 pagini
-            if page % 5 == 0:
-                status_container.warning(f"💾 Salvez batch {page}...")
-                
-                # INSERT produse noi
-                if batch_new_stock:
-                    try:
-                        supabase.table("claude_woo_stock").insert(batch_new_stock).execute()
-                        batch_new_stock = []
-                    except Exception as e:
-                        st.warning(f"Eroare insert stock: {e}")
-                
-                if batch_new_price:
-                    try:
-                        supabase.table("claude_woo_prices").insert(batch_new_price).execute()
-                        batch_new_price = []
-                    except Exception as e:
-                        st.warning(f"Eroare insert prices: {e}")
-                
-                # UPDATE produse existente (TOATE)
-                if batch_update_stock:
-                    try:
-                        for item in batch_update_stock:
-                            supabase.table("claude_woo_stock").update({
-                                "stock_quantity": item["stock_quantity"],
-                                "woo_product_id": item["woo_product_id"],
-                                "last_sync_at": item["last_sync_at"]
-                            }).eq("sku", item["sku"]).execute()
-                        batch_update_stock = []
-                    except Exception as e:
-                        st.warning(f"Eroare update stock: {e}")
-                
-                if batch_update_price:
-                    try:
-                        for item in batch_update_price:
-                            supabase.table("claude_woo_prices").update({
-                                "regular_price": item["regular_price"],
-                                "woo_product_id": item["woo_product_id"],
-                                "last_sync_at": item["last_sync_at"]
-                            }).eq("sku", item["sku"]).execute()
-                        batch_update_price = []
-                    except Exception as e:
-                        st.warning(f"Eroare update prices: {e}")
-            
-            progress_bar.progress(min(page / 30, 0.99))
+            progress_bar.progress(min(page / 30, 0.95))
             page += 1
-            time.sleep(0.3)
+            time.sleep(0.2)
             
         except Exception as e:
-            st.error(f"❌ Eroare pagină {page}: {e}")
+            error_msg = f"Eroare critică pagina {page}: {e}"
+            st.error(f"❌ {error_msg}")
+            log_event("step1_error", error_msg, status="error")
             break
     
-    # Salvează ultimul batch
-    status_container.warning(f"💾 Finalizare PASUL 1...")
+    # UPSERT în batch-uri de 500 (eficient, fără timeout)
+    status_container.info(f"💾 Salvez {total_products} produse în database...")
+    log_event("step1_process", f"Procesez {total_products} produse citite din WooCommerce", status="info")
     
-    if batch_new_stock:
-        try:
-            supabase.table("claude_woo_stock").insert(batch_new_stock).execute()
-        except Exception as e:
-            st.warning(f"Eroare insert final stock: {e}")
+    saved_stock = 0
+    saved_prices = 0
+    batch_size = 500
     
-    if batch_new_price:
-        try:
-            supabase.table("claude_woo_prices").insert(batch_new_price).execute()
-        except Exception as e:
-            st.warning(f"Eroare insert final prices: {e}")
-    
-    if batch_update_stock:
-        try:
-            for item in batch_update_stock:
-                supabase.table("claude_woo_stock").update({
-                    "stock_quantity": item["stock_quantity"],
-                    "woo_product_id": item["woo_product_id"],
-                    "last_sync_at": item["last_sync_at"]
-                }).eq("sku", item["sku"]).execute()
-        except Exception as e:
-            st.warning(f"Eroare update final stock: {e}")
-    
-    if batch_update_price:
-        try:
-            for item in batch_update_price:
-                supabase.table("claude_woo_prices").update({
-                    "regular_price": item["regular_price"],
-                    "woo_product_id": item["woo_product_id"],
-                    "last_sync_at": item["last_sync_at"]
-                }).eq("sku", item["sku"]).execute()
-        except Exception as e:
-            st.warning(f"Eroare update final prices: {e}")
+    try:
+        # UPSERT stocuri în batch-uri
+        for i in range(0, len(all_stock_data), batch_size):
+            batch = all_stock_data[i:i+batch_size]
+            try:
+                supabase.table("claude_woo_stock").upsert(
+                    batch,
+                    on_conflict="sku"
+                ).execute()
+                saved_stock += len(batch)
+                status_container.info(f"💾 Salvat stoc: {saved_stock}/{len(all_stock_data)}")
+            except Exception as e:
+                log_event("step1_error", f"Eroare upsert stoc batch {i}: {e}", status="error")
+        
+        # UPSERT prețuri în batch-uri
+        for i in range(0, len(all_price_data), batch_size):
+            batch = all_price_data[i:i+batch_size]
+            try:
+                supabase.table("claude_woo_prices").upsert(
+                    batch,
+                    on_conflict="sku"
+                ).execute()
+                saved_prices += len(batch)
+                status_container.info(f"💾 Salvat prețuri: {saved_prices}/{len(all_price_data)}")
+            except Exception as e:
+                log_event("step1_error", f"Eroare upsert prețuri batch {i}: {e}", status="error")
+        
+    except Exception as e:
+        error_msg = f"Eroare salvare batch: {e}"
+        st.error(f"❌ {error_msg}")
+        log_event("step1_error", error_msg, status="error")
     
     progress_bar.progress(1.0)
     status_container.empty()
     
-    log_event("step1_complete", f"PASUL 1 complet: {total_new} noi, {total_updated} actualizate (forțat), {total_errors} erori", status="success")
+    success_msg = f"PASUL 1 complet: {saved_stock} stocuri salvate, {saved_prices} prețuri salvate, {total_errors} erori"
+    log_event("step1_complete", success_msg, status="success")
     
-    st.success(f"✅ **PASUL 1 finalizat:**\n- 🆕 {total_new} produse noi\n- 🔄 {total_updated} produse actualizate\n- ❌ {total_errors} erori")
+    st.success(f"""
+    ✅ **PASUL 1 FINALIZAT:**
+    - 📦 {saved_stock} produse sincronizate (stoc)
+    - 💰 {saved_prices} produse sincronizate (prețuri)
+    - ❌ {total_errors} erori
+    """)
     
-    return total_new, total_updated, 0, total_errors
+    return total_products, saved_stock, saved_prices, total_errors
 
 
 # ============ PASUL 2: Import + Normalizare artcode ============
@@ -411,8 +347,9 @@ def step2_import_foneday_all_products():
         )
         
         if response.status_code != 200:
-            st.error(f"❌ Eroare API Foneday: {response.status_code}")
-            log_event("step2_error", f"Eroare API Foneday: {response.status_code}", status="error")
+            error_msg = f"Eroare API Foneday: {response.status_code}"
+            st.error(f"❌ {error_msg}")
+            log_event("step2_error", error_msg, status="error")
             return 0
         
         data = response.json()
@@ -420,9 +357,11 @@ def step2_import_foneday_all_products():
         
         if not products:
             st.warning("⚠️ Nu s-au găsit produse în Foneday")
+            log_event("step2_warning", "Nu s-au găsit produse în Foneday", status="warning")
             return 0
         
         status_container.success(f"✅ Găsite {len(products)} produse în Foneday")
+        log_event("step2_process", f"Procesez {len(products)} produse Foneday", status="info")
         time.sleep(1)
         
         batch_size = 100
@@ -477,6 +416,7 @@ def step2_import_foneday_all_products():
                                 })
                 
                 except Exception as e:
+                    log_event("step2_error", f"Eroare procesare produs Foneday: {e}", status="error")
                     continue
             
             if batch_data:
@@ -487,7 +427,7 @@ def step2_import_foneday_all_products():
                     ).execute()
                     total_saved += len(batch_data)
                 except Exception as e:
-                    st.error(f"Eroare salvare produse: {e}")
+                    log_event("step2_error", f"Eroare salvare produse: {e}", status="error")
             
             if batch_artcodes:
                 try:
@@ -497,7 +437,7 @@ def step2_import_foneday_all_products():
                     ).execute()
                     total_artcodes_normalized += len(batch_artcodes)
                 except Exception as e:
-                    st.error(f"Eroare salvare artcodes: {e}")
+                    log_event("step2_error", f"Eroare salvare artcodes: {e}", status="error")
             
             status_container.info(f"💾 Salvate {total_saved}/{len(products)} produse, {total_artcodes_normalized} artcodes...")
             progress_bar.progress(total_saved / len(products))
@@ -505,13 +445,21 @@ def step2_import_foneday_all_products():
         progress_bar.progress(1.0)
         status_container.empty()
         
-        log_event("step2_complete", f"PASUL 2 complet: {total_saved} produse, {total_artcodes_normalized} artcodes normalizate", status="success")
+        success_msg = f"PASUL 2 complet: {total_saved} produse, {total_artcodes_normalized} artcodes normalizate"
+        log_event("step2_complete", success_msg, status="success")
+        
+        st.success(f"""
+        ✅ **PASUL 2 FINALIZAT:**
+        - 📦 {total_saved} produse Foneday salvate
+        - 🔗 {total_artcodes_normalized} artcodes normalizate
+        """)
         
         return total_saved
         
     except Exception as e:
-        st.error(f"❌ Eroare PASUL 2: {e}")
-        log_event("step2_error", f"Eroare: {e}", status="error")
+        error_msg = f"Eroare PASUL 2: {e}"
+        st.error(f"❌ {error_msg}")
+        log_event("step2_error", error_msg, status="error")
         return 0
 
 
@@ -552,9 +500,11 @@ def step3_map_sku_to_artcode():
         
         if not all_my_skus:
             st.warning("Nu există SKU-uri de mapat")
+            log_event("step3_warning", "Nu există SKU-uri de mapat", status="warning")
             return 0
         
         status_container.success(f"✅ Total {len(all_my_skus)} SKU-uri în catalog")
+        log_event("step3_process", f"Procesez {len(all_my_skus)} SKU-uri", status="info")
         progress_bar.progress(0.3)
         
         status_container.info("📂 Citesc toate artcode-urile Foneday...")
@@ -583,9 +533,11 @@ def step3_map_sku_to_artcode():
         
         if not all_artcodes:
             st.warning("Nu există artcode-uri Foneday")
+            log_event("step3_warning", "Nu există artcode-uri Foneday", status="warning")
             return 0
         
         status_container.success(f"✅ Total {len(all_artcodes)} artcode-uri Foneday")
+        log_event("step3_process", f"Procesez {len(all_artcodes)} artcodes", status="info")
         progress_bar.progress(0.6)
         
         status_container.info("🔗 Creez mapări în memorie...")
@@ -617,13 +569,15 @@ def step3_map_sku_to_artcode():
                     })
         
         status_container.success(f"✅ Create {len(batch_mappings)} mapări în memorie")
+        log_event("step3_process", f"Create {len(batch_mappings)} mapări", status="info")
         progress_bar.progress(0.8)
         
         if not batch_mappings:
             st.warning("Nu s-au găsit match-uri între SKU-uri și Foneday")
+            log_event("step3_warning", "Nu s-au găsit match-uri", status="warning")
             return 0
         
-        status_container.info("💾 Salvez mapări (FĂRĂ să șterg cele vechi)...")
+        status_container.info("💾 Salvez mapări...")
         
         total_saved = 0
         batch_size = 500
@@ -639,7 +593,7 @@ def step3_map_sku_to_artcode():
                 total_saved += len(batch)
                 status_container.info(f"💾 Salvate {total_saved}/{len(batch_mappings)} mapări...")
             except Exception as e:
-                st.warning(f"⚠️ Eroare batch {i//batch_size + 1}: {e}")
+                log_event("step3_error", f"Eroare batch {i//batch_size + 1}: {e}", status="error")
                 errors += 1
                 if errors > 5:
                     st.error("Prea multe erori, opresc procesul")
@@ -652,51 +606,84 @@ def step3_map_sku_to_artcode():
         final_count = supabase.table("claude_sku_artcode_mapping").select("*", count="exact").execute()
         total_in_db = final_count.count if final_count.count else 0
         
-        log_event("step3_complete", f"PASUL 3 complet: {total_saved} procesate, {total_in_db} total în DB", status="success")
+        success_msg = f"PASUL 3 complet: {total_saved} mapări salvate, {total_in_db} total în DB"
+        log_event("step3_complete", success_msg, status="success")
+        
+        st.success(f"""
+        ✅ **PASUL 3 FINALIZAT:**
+        - 🔗 {total_saved} mapări procesate
+        - 📊 {total_in_db} mapări totale în DB
+        """)
         
         return total_in_db
         
     except Exception as e:
-        st.error(f"❌ Eroare PASUL 3: {e}")
-        log_event("step3_error", f"Eroare: {e}", status="error")
+        error_msg = f"Eroare PASUL 3: {e}"
+        st.error(f"❌ {error_msg}")
+        log_event("step3_error", error_msg, status="error")
         progress_bar.progress(0)
         status_container.empty()
         return 0
 
 
-# ============ PASUL 4: Verifică stoc (EXCLUDE comenzi în tranzit) ============
+# ============ PASUL 4: Verifică stoc (FIX - exclude și delivered recent) ============
 def step4_check_stock_and_prices():
-    """PASUL 4: Verifică stoc și prețuri - EXCLUDE produse cu comenzi pending"""
+    """PASUL 4: Verifică stoc și prețuri - EXCLUDE produse cu comenzi pending sau recent livrate"""
     
     progress_bar = st.progress(0)
     status_container = st.empty()
     
     log_event("step4_start", "PASUL 4: Verificare stoc și prețuri Foneday", status="info")
     
-    status_container.info("🔍 PASUL 4: Găsesc produse cu stoc zero (exclude comenzi în tranzit)...")
+    status_container.info("🔍 PASUL 4: Găsesc produse cu stoc zero (exclude comenzi în tranzit și recent livrate)...")
     
-    pending_orders = supabase.table("claude_foneday_orders_pending").select("sku, quantity").eq("status", "pending").execute()
+    pending_orders = supabase.table("claude_foneday_orders_pending").select("sku, quantity, status, updated_at").in_("status", ["pending", "delivered"]).execute()
     
     pending_skus = {}
+    delivered_recently_skus = {}
+    
     if pending_orders.data:
         for order in pending_orders.data:
             sku = order["sku"]
             qty = order["quantity"]
-            pending_skus[sku] = pending_skus.get(sku, 0) + qty
+            status = order["status"]
+            
+            if status == "pending":
+                pending_skus[sku] = pending_skus.get(sku, 0) + qty
+            elif status == "delivered":
+                try:
+                    updated_at = datetime.fromisoformat(order['updated_at'].replace('Z', '+00:00'))
+                    days_since_delivery = (datetime.now(updated_at.tzinfo) - updated_at).days
+                    
+                    if days_since_delivery <= 7:
+                        delivered_recently_skus[sku] = delivered_recently_skus.get(sku, 0) + qty
+                except:
+                    pass
     
     if pending_skus:
-        st.info(f"📦 Găsite {len(pending_skus)} SKU-uri cu comenzi în tranzit (vor fi excluse)")
+        log_msg = f"Găsite {len(pending_skus)} SKU-uri cu comenzi în tranzit"
+        st.info(f"📦 {log_msg}")
+        log_event("step4_process", log_msg, status="info")
+    
+    if delivered_recently_skus:
+        log_msg = f"Găsite {len(delivered_recently_skus)} SKU-uri livrate recent (7 zile)"
+        st.info(f"✅ {log_msg}")
+        log_event("step4_process", log_msg, status="info")
     
     zero_stock_result = supabase.table("claude_woo_stock").select("*").lte("stock_quantity", 0).execute()
     
     if not zero_stock_result.data:
         status_container.success("✅ Nu există produse cu stoc zero!")
+        log_event("step4_complete", "Nu există produse cu stoc zero", status="success")
         return 0, 0
     
     zero_stock_products = zero_stock_result.data
+    log_event("step4_process", f"Verificare {len(zero_stock_products)} produse cu stoc zero", status="info")
+    
     total_checked = 0
     total_available = 0
     total_skipped_pending = 0
+    total_skipped_delivered = 0
     
     for idx, product_data in enumerate(zero_stock_products):
         my_sku = product_data.get("sku")
@@ -704,6 +691,11 @@ def step4_check_stock_and_prices():
         if my_sku in pending_skus:
             total_skipped_pending += 1
             status_container.info(f"⏭️ SKIP {my_sku} - Comandă în tranzit: {pending_skus[my_sku]} buc")
+            continue
+        
+        if my_sku in delivered_recently_skus:
+            total_skipped_delivered += 1
+            status_container.info(f"⏭️ SKIP {my_sku} - Livrată recent: {delivered_recently_skus[my_sku]} buc")
             continue
         
         status_container.info(f"🔍 PASUL 4: Verific {idx+1}/{len(zero_stock_products)}: {my_sku}")
@@ -748,7 +740,16 @@ def step4_check_stock_and_prices():
     progress_bar.progress(1.0)
     status_container.empty()
     
-    log_event("step4_complete", f"PASUL 4: {total_checked} verificate, {total_available} disponibile, {total_skipped_pending} skip (pending)", status="success")
+    success_msg = f"PASUL 4: {total_checked} verificate, {total_available} disponibile, {total_skipped_pending} skip (pending), {total_skipped_delivered} skip (delivered recent)"
+    log_event("step4_complete", success_msg, status="success")
+    
+    st.success(f"""
+    ✅ **PASUL 4 FINALIZAT:**
+    - 🔍 {total_checked} produse verificate la Foneday
+    - ✅ {total_available} disponibile pentru comandă
+    - ⏭️ {total_skipped_pending} excluse (comandă în tranzit)
+    - ⏭️ {total_skipped_delivered} excluse (livrate recent)
+    """)
     
     return total_checked, total_available
 
@@ -768,9 +769,12 @@ def step5_add_to_cart():
     
     if not inventory_result.data:
         status_container.info("Nu există produse disponibile la Foneday")
+        log_event("step5_complete", "Nu există produse disponibile", status="info")
         return 0, 0
     
     available_products = inventory_result.data
+    log_event("step5_process", f"Procesez {len(available_products)} produse disponibile", status="info")
+    
     added_to_cart = 0
     not_profitable = 0
     
@@ -823,7 +827,14 @@ def step5_add_to_cart():
     progress_bar.progress(1.0)
     status_container.empty()
     
-    log_event("step5_complete", f"PASUL 5 complet: {added_to_cart} adăugate, {not_profitable} neprofitabile", status="success")
+    success_msg = f"PASUL 5 complet: {added_to_cart} adăugate, {not_profitable} neprofitabile"
+    log_event("step5_complete", success_msg, status="success")
+    
+    st.success(f"""
+    ✅ **PASUL 5 FINALIZAT:**
+    - 🛒 {added_to_cart} produse adăugate în coș
+    - ❌ {not_profitable} produse neprofitabile (excluse)
+    """)
     
     return added_to_cart, not_profitable
 
@@ -1019,16 +1030,18 @@ elif page == "🔄 Import Individual (Pași)":
         ### **Pasul 1: 📥 Sincronizare WooCommerce**
         
         **Ce face:**
-        - Citește toate produsele din WooCommerce prin API
+        - Citește TOATE produsele din WooCommerce prin API (toate paginile)
         - Extrage: SKU, stoc, preț, ID produs
-        - Compară cu datele existente în Supabase
-        - **Produse noi** → le adaugă
-        - **Stoc/preț modificat** → le actualizează
-        - **Nemodificat** → le ignoră (eficiență maximă)
+        - **FORȚEAZĂ sincronizare completă** (UPSERT batch) - NU mai verifică dacă s-a schimbat ceva
+        - Salvează în batch-uri de 500 produse (rapid, fără timeout)
         
-        **Rezultat:** Tabele `claude_woo_stock` și `claude_woo_prices` actualizate
+        **Rezultat:** 
+        - Tabele `claude_woo_stock` și `claude_woo_prices` **COMPLET ACTUALIZATE**
+        - TOATE produsele au `last_sync_at` = astăzi
         
-        **Când:** Zilnic sau când modifici ceva în WooCommerce
+        **Când:** **ZILNIC** sau când modifici ceva în WooCommerce
+        
+        **⚠️ Important:** Acest pas TREBUIE rulat ZILNIC pentru stocuri corecte!
         
         ---
         
@@ -1038,22 +1051,22 @@ elif page == "🔄 Import Individual (Pași)":
         - Accesează `GET /products` din API Foneday
         - Descarcă **TOATE produsele** disponibile (mii)
         - Salvează: `foneday_sku`, `artcode` (=SKU-ul tău), preț, stoc, etc.
-        - **NORMALIZARE artcode**: Dacă artcode e array `["GH82-18850B", "GH82-18835B"]`, extrage fiecare valoare separat
+        - **NORMALIZARE artcode**: Dacă artcode e array, extrage fiecare valoare separat
         
         **Rezultat:** 
-        - Tabel `claude_foneday_products` = catalog complet
-        - Tabel `claude_foneday_artcodes_normalized` = fiecare artcode pe rând separat
+        - Tabel `claude_foneday_products` = catalog complet Foneday
+        - Tabel `claude_foneday_artcodes_normalized` = fiecare artcode separat pentru mapare
         
-        **Când:** O dată pe săptămână (catalogul Foneday nu se schimbă zilnic)
+        **Când:** **Săptămânal** (catalogul Foneday nu se schimbă zilnic)
         
         ---
         
         ### **Pasul 3: 🗺️ Mapare SKU-uri**
         
         **Ce face:**
-        - Ia fiecare SKU din catalogul tău
+        - Ia fiecare SKU din catalogul tău (catalog.product_sku)
         - Caută în tabelul normalizat unde `artcode` = SKU-ul tău
-        - **Dacă găsește** → creează legătura: `my_sku` ↔ `foneday_artcode` ↔ `foneday_sku`
+        - Creează legătura: `my_sku` ↔ `foneday_artcode` ↔ `foneday_sku`
         
         **Rezultat:** Tabel `claude_sku_artcode_mapping` cu toate legăturile
         
@@ -1061,32 +1074,33 @@ elif page == "🔄 Import Individual (Pași)":
         
         ---
         
-        ### **Pasul 4: 🔍 Verificare Stoc & Preț (Stoc Zero)**
+        ### **Pasul 4: 🔍 Verificare Stoc & Preț (Produse cu stoc zero)**
         
         **Ce face:**
-        - Găsește produsele tale cu stoc zero
-        - **EXCLUDE produse cu comenzi în tranzit** (evită dublare comenzi)
-        - Pentru fiecare: găsește maparea → verifică prin API Foneday (timp real)
-        - **Dacă e disponibil** → salvează în `claude_foneday_inventory`
+        - Găsește produsele tale cu stoc zero (din `claude_woo_stock`)
+        - **EXCLUDE produse cu comenzi în tranzit** (status="pending")
+        - **EXCLUDE produse livrate recent** (ultimele 7 zile) - evită dubla comandă
+        - Pentru fiecare produs rămas: verifică prin API Foneday (timp real) dacă e disponibil
+        - Salvează în `claude_foneday_inventory` produsele disponibile
         
-        **Rezultat:** Știi ce produse cu stoc 0 poți reaproviziona
+        **Rezultat:** Știi exact ce produse cu stoc 0 poți reaproviziona (fără duplicate)
         
-        **Când:** Zilnic pentru reaprovizionare
+        **Când:** **ZILNIC** pentru reaprovizionare (DUPĂ PASUL 1!)
         
         ---
         
         ### **Pasul 5: 🛒 Adăugare Automată în Coș**
         
         **Ce face:**
-        - Ia produsele disponibile la Foneday (din inventar)
+        - Ia produsele disponibile la Foneday (din `claude_foneday_inventory`)
         - Calculează marja de profit:
           - Cost RON = Preț EUR × 5.1
           - Preț vânzare fără TVA = Preț WooCommerce / 1.21
           - Marjă = (1 - Cost/Preț vânzare) × 100%
-        - **Dacă profitabil (≥12%)** → adaugă **2 bucăți** în coșul Foneday
-        - **Dacă neprofitabil** → doar salvează în tabel
+        - **Dacă profitabil (≥12%)** → adaugă **2 bucăți** în coșul Foneday (prin API)
+        - Salvează în `claude_foneday_cart` cu status="added_to_cart"
         
-        **Rezultat:** Produse profitabile adăugate automat în coș, tu doar finalizezi comanda
+        **Rezultat:** Produse profitabile adăugate automat în coș, tu doar confirmi comanda
         
         **Când:** După Pasul 4, când vrei să comanzi automat
         
@@ -1095,18 +1109,25 @@ elif page == "🔄 Import Individual (Pași)":
         ### **🎯 Workflow Recomandat:**
         
         **Prima rulare (setup):**
-        1. Pasul 1 → Import WooCommerce
-        2. Pasul 2 → Import Foneday + Normalizare (durează mai mult)
-        3. Pasul 3 → Mapare SKU-uri
+        1. ✅ Pasul 1 → Sincronizare WooCommerce (OBLIGATORIU)
+        2. ✅ Pasul 2 → Import Foneday + Normalizare (durează mai mult)
+        3. ✅ Pasul 3 → Mapare SKU-uri
         
-        **Zilnic (reaprovizionare):**
-        1. Pasul 1 → Actualizează stocuri/prețuri
-        2. Pasul 4 → Verifică stoc zero (exclude comenzi în tranzit)
-        3. Pasul 5 → Adaugă în coș
-        4. Mergi la "🚚 Comenzi în Tranzit" → Confirmă comenzile
+        **Zilnic (reaprovizionare automată):**
+        1. ✅ **Pasul 1** → Actualizează TOATE stocurile/prețurile (OBLIGATORIU!)
+        2. ✅ Pasul 4 → Verifică stoc zero (exclude comenzi în tranzit)
+        3. ✅ Pasul 5 → Adaugă automat în coș
+        4. ✅ Mergi la "🚚 Comenzi în Tranzit" → Confirmă comenzile plasate
         
         **Săptămânal (optimizare):**
-        - 💰 Oportunități Profit (marjă mare)
+        - Pasul 2 → Actualizează catalog Foneday
+        - Pasul 3 → Re-mapare (dacă ai produse noi)
+        - 💰 Oportunități Profit (găsește produse cu marjă mare care se vând deja)
+        
+        **⚠️ FOARTE IMPORTANT:**
+        - **PASUL 1 trebuie rulat ZILNIC** - altfel stocurile rămân vechi!
+        - **Workflow corect**: Pasul 1 → apoi Pasul 4 → apoi Pasul 5
+        - **Nu rula Pasul 4 fără Pasul 1** - vei comanda produse duplicate!
         """)
     
     st.markdown("---")
@@ -1115,11 +1136,10 @@ elif page == "🔄 Import Individual (Pași)":
     
     with col1:
         st.markdown("### Pasul 1")
-        st.caption("📥 Import WooCommerce")
+        st.caption("📥 Sync WooCommerce")
         if st.button("▶️ Rulează", key="btn_step1", use_container_width=True):
-            st.markdown("## 📥 PASUL 1: Import WooCommerce")
-            new, updated, unchanged, errors = step1_import_woocommerce()
-            st.success(f"✅ Complet: {new} noi, {updated} actualizate")
+            st.markdown("## 📥 PASUL 1: Sincronizare WooCommerce")
+            total, saved_stock, saved_prices, errors = step1_import_woocommerce()
     
     with col2:
         st.markdown("### Pasul 2")
@@ -1127,7 +1147,6 @@ elif page == "🔄 Import Individual (Pași)":
         if st.button("▶️ Rulează", key="btn_step2", use_container_width=True):
             st.markdown("## 🌐 PASUL 2: Import Foneday")
             total_foneday = step2_import_foneday_all_products()
-            st.success(f"✅ Complet: {total_foneday} produse")
     
     with col3:
         st.markdown("### Pasul 3")
@@ -1135,7 +1154,6 @@ elif page == "🔄 Import Individual (Pași)":
         if st.button("▶️ Rulează", key="btn_step3", use_container_width=True):
             st.markdown("## 🗺️ PASUL 3: Mapare")
             total_mapped = step3_map_sku_to_artcode()
-            st.success(f"✅ Complet: {total_mapped} mapări")
     
     with col4:
         st.markdown("### Pasul 4")
@@ -1143,7 +1161,6 @@ elif page == "🔄 Import Individual (Pași)":
         if st.button("▶️ Rulează", key="btn_step4", use_container_width=True):
             st.markdown("## 🔍 PASUL 4: Verificare")
             checked, available = step4_check_stock_and_prices()
-            st.success(f"✅ Complet: {available} disponibile")
     
     with col5:
         st.markdown("### Pasul 5")
@@ -1151,7 +1168,6 @@ elif page == "🔄 Import Individual (Pași)":
         if st.button("▶️ Rulează", key="btn_step5", use_container_width=True):
             st.markdown("## 🛒 PASUL 5: Coș")
             added, not_profitable = step5_add_to_cart()
-            st.success(f"✅ Complet: {added} adăugate")
     
     st.markdown("---")
     
@@ -1175,33 +1191,28 @@ elif page == "🔄 Import Individual (Pași)":
         start_time = datetime.now()
         
         if run_step1:
-            st.markdown("## 📥 PASUL 1: Import WooCommerce")
-            new, updated, unchanged, errors = step1_import_woocommerce()
-            st.success(f"✅ PASUL 1: {new} noi, {updated} actualizate")
+            st.markdown("## 📥 PASUL 1: Sincronizare WooCommerce")
+            total, saved_stock, saved_prices, errors = step1_import_woocommerce()
             st.markdown("---")
         
         if run_step2:
             st.markdown("## 🌐 PASUL 2: Import Foneday")
             total_foneday = step2_import_foneday_all_products()
-            st.success(f"✅ PASUL 2: {total_foneday} produse")
             st.markdown("---")
         
         if run_step3:
             st.markdown("## 🗺️ PASUL 3: Mapare")
             total_mapped = step3_map_sku_to_artcode()
-            st.success(f"✅ PASUL 3: {total_mapped} mapări")
             st.markdown("---")
         
         if run_step4:
             st.markdown("## 🔍 PASUL 4: Verificare")
             checked, available = step4_check_stock_and_prices()
-            st.success(f"✅ PASUL 4: {available} disponibile")
             st.markdown("---")
         
         if run_step5:
             st.markdown("## 🛒 PASUL 5: Coș")
             added, not_profitable = step5_add_to_cart()
-            st.success(f"✅ PASUL 5: {added} adăugate")
         
         end_time = datetime.now()
         duration = (end_time - start_time).total_seconds()
@@ -1504,17 +1515,15 @@ elif page == "🚚 Comenzi în Tranzit":
     
     st.markdown("---")
     
-    # BUTON NOU - Golire comenzi
     col1, col2, col3 = st.columns([1, 1, 1])
     with col2:
         if st.button("🗑️ GOLEȘTE TOATE COMENZILE", type="secondary", use_container_width=True):
             if st.session_state.get('confirm_clear_orders'):
                 try:
-                    # Șterge din coș
                     supabase.table("claude_foneday_cart").delete().eq("status", "added_to_cart").execute()
-                    # Șterge din pending
                     supabase.table("claude_foneday_orders_pending").delete().eq("status", "pending").execute()
                     st.success("✅ Toate comenzile au fost șterse!")
+                    log_event("clear_orders", "Toate comenzile au fost șterse", status="warning")
                     st.session_state['confirm_clear_orders'] = False
                     time.sleep(1)
                     st.rerun()
@@ -1572,6 +1581,8 @@ elif page == "🚚 Comenzi în Tranzit":
                                 "status": "confirmed"
                             }).eq("id", item["id"]).execute()
                             
+                            log_event("confirm_order", f"Confirmat: {item['sku']} × {item['quantity']}", sku=item['sku'], status="success")
+                            
                             st.success(f"✅ Comanda confirmată: {item['sku']} × {item['quantity']}")
                             time.sleep(1)
                             st.rerun()
@@ -1595,7 +1606,6 @@ elif page == "🚚 Comenzi în Tranzit":
                     st.text(f"{order['sku']} × {order['quantity']}")
                 
                 with col2:
-                    # FIX: Handle date parsing safely
                     try:
                         if order.get('order_date'):
                             if isinstance(order['order_date'], str):
@@ -1617,7 +1627,6 @@ elif page == "🚚 Comenzi în Tranzit":
                         st.text("🚚 N/A")
                 
                 with col4:
-                    # FIX: Calculate days_ago safely
                     try:
                         if order.get('order_date'):
                             if isinstance(order['order_date'], str):
@@ -1625,7 +1634,6 @@ elif page == "🚚 Comenzi în Tranzit":
                             else:
                                 order_dt = order['order_date']
                             
-                            # Make both timezone-aware or both naive
                             if order_dt.tzinfo is not None:
                                 now_dt = datetime.now(order_dt.tzinfo)
                             else:
@@ -1649,6 +1657,8 @@ elif page == "🚚 Comenzi în Tranzit":
                                     "updated_at": datetime.now().isoformat()
                                 }).eq("id", order["id"]).execute()
                                 
+                                log_event("deliver_order", f"Livrat: {order['sku']}", sku=order['sku'], status="success")
+                                
                                 st.success(f"✅ Marcat ca livrat: {order['sku']}")
                                 time.sleep(1)
                                 st.rerun()
@@ -1662,6 +1672,8 @@ elif page == "🚚 Comenzi în Tranzit":
                                     "status": "cancelled",
                                     "updated_at": datetime.now().isoformat()
                                 }).eq("id", order["id"]).execute()
+                                
+                                log_event("cancel_order", f"Anulat: {order['sku']}", sku=order['sku'], status="warning")
                                 
                                 st.warning(f"❌ Comandă anulată: {order['sku']}")
                                 time.sleep(1)
@@ -1730,5 +1742,5 @@ elif page == "📝 Log":
 
 
 st.sidebar.markdown("---")
-st.sidebar.caption("📦 ServicePack v4.1")
-st.sidebar.caption("Fix eroare date + Golire comenzi")
+st.sidebar.caption("📦 ServicePack v5.0")
+st.sidebar.caption("UPSERT batch + Log detaliat + Fix timeout")
